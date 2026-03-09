@@ -1,0 +1,44 @@
+[project]
+name = "pallas-kernel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch",
+    "torchvision",
+]
+tpu = [
+    "jax[tpu]",
+    "torch",
+    "torch-xla[tpu]",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "gpu" },
+        { extra = "tpu" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", extra = "gpu" },
+    { index = "pytorch-cpu", extra = "tpu" },
+]
+torchvision = [{ index = "pytorch-cu126", extra = "gpu" }]

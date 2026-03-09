@@ -1,0 +1,6 @@
+[submodule "third_party/flash-linear-attention"]
+	path = third_party/flash-linear-attention
+	url = git@github.com:fla-org/flash-linear-attention.git
+[submodule "third_party/tokamax"]
+	path = third_party/tokamax
+	url = git@github.com:openxla/tokamax.git
