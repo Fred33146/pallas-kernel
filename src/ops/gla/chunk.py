@@ -7,6 +7,9 @@ import numpy as np
 from jax.experimental.pallas import dslice
 from jax.experimental.pallas import tpu as pltpu
 from src.utils import prepare_chunk_indices
+from src.ops.utils import is_tpu_runtime
+from src.ops.common.chunk_h import chunk_fwd_h_kernel
+
 
 # =============================================================================
 # Sub-function 1: chunk_local_cumsum
@@ -98,7 +101,7 @@ def chunk_local_cumsum_vector(
     HAS_SCALE = scale is not None
     scale_val = scale if scale is not None else 1.0
 
-    interpret = jax.local_devices()[0].platform != "tpu"
+    interpret = not is_tpu_runtime()
 
     # Pad the S dimension to satisfy TPU shape constraints.
     pad_S = (BS - (S % BS)) % BS
@@ -465,21 +468,24 @@ def chunk_gla_fwd(
         pad_width = ((0, 0), (0, pad), (0, 0), (0, 0))
         q = jnp.pad(q, pad_width)
         k = jnp.pad(k, pad_width)
-        v = jnp.pad(v, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        v = jnp.pad(v, pad_width)
         g = jnp.pad(g, pad_width)
 
     if g_cumsum is None:
         g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
 
-    h, ht = chunk_fwd_h_ref(
+    h, ht = chunk_fwd_h_kernel(
         k,
         v,
         gk=g_cumsum,
         h0=initial_state,
         output_final_state=output_final_state,
-        cu_seqlens_cpu=cu_seqlens,
+        cu_seqlens=cu_seqlens,
         chunk_size=C,
+        interpret=not is_tpu_runtime(),
     )
+    if cu_seqlens is None:
+        h = h.reshape(k.shape[0], -1, k.shape[2], k.shape[3], v.shape[-1])
     A = chunk_gla_fwd_intra_gk(q, k, g_cumsum, scale, chunk_size=C)
     o = chunk_gla_fwd_o_gk(
         q, v, g_cumsum, A, h, scale, chunk_size=C, cu_seqlens_cpu=cu_seqlens
