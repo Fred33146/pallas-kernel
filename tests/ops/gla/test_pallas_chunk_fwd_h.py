@@ -40,7 +40,7 @@ PALLAS_CASES = [
         K=256,
         chunk_size=64,
         seed=11,
-    )
+    ),
 ]
 
 
@@ -108,7 +108,7 @@ def _run_pallas(
         output_final_state=True,
     )
     if cu is None:
-         h = h.reshape(k.shape[0], -1, k.shape[2], k.shape[3], v.shape[-1])
+        h = h.reshape(k.shape[0], -1, k.shape[2], k.shape[3], v.shape[-1])
     return h, ht
 
 
