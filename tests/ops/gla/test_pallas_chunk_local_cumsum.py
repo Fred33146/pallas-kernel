@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import numpy as np
 import pytest
+from _pytest.mark.structures import ParameterSet
 import torch
 import jax
 import jax.numpy as jnp
@@ -90,10 +91,178 @@ PALLAS_CASES = [
         chunk_indices=None,
         seed=66,
     ),
+    # ---- head_first=True ----
+    dict(
+        B=2,
+        T=64,
+        H=4,
+        K=128,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=True,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=77,
+    ),
+    dict(
+        B=2,
+        T=64,
+        H=3,
+        K=128,
+        chunk_size=16,
+        reverse=True,
+        scale=0.5,
+        cu_seqlens=None,
+        head_first=True,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=78,
+    ),
+    # ---- bfloat16 output dtype ----
+    dict(
+        B=2,
+        T=32,
+        H=4,
+        K=128,
+        chunk_size=16,
+        reverse=False,
+        scale=0.125,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.bfloat16,
+        chunk_indices=None,
+        seed=79,
+        atol=1e-2,
+        rtol=1e-2,
+    ),
+    # ---- K < 128 (small BS) ----
+    dict(
+        B=2,
+        T=32,
+        H=4,
+        K=64,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=80,
+    ),
+    # ---- K > 128 (multi S-tile, NS > 1) ----
+    dict(
+        B=2,
+        T=32,
+        H=2,
+        K=256,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=81,
+    ),
+    # ---- K not multiple of 128 (S-padding + multi S-tile) ----
+    dict(
+        B=2,
+        T=32,
+        H=2,
+        K=192,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=82,
+    ),
+    # ---- single chunk (chunk_size == T) ----
+    dict(
+        B=2,
+        T=16,
+        H=4,
+        K=128,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=83,
+    ),
+    # ---- varlen: 3 segments ----
+    dict(
+        B=1,
+        T=48,
+        H=2,
+        K=128,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=[0, 16, 32, 48],
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=84,
+    ),
+    # ---- varlen + reverse + scale (combined) ----
+    dict(
+        B=1,
+        T=33,
+        H=2,
+        K=128,
+        chunk_size=16,
+        reverse=True,
+        scale=0.25,
+        cu_seqlens=[0, 17, 33],
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=85,
+    ),
+    # ---- varlen: unequal segment lengths ----
+    dict(
+        B=1,
+        T=56,
+        H=2,
+        K=128,
+        chunk_size=16,
+        reverse=False,
+        scale=None,
+        cu_seqlens=[0, 8, 40, 56],
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=86,
+    ),
+    # ---- reverse without scale (fixed-length, larger) ----
+    dict(
+        B=2,
+        T=64,
+        H=4,
+        K=128,
+        chunk_size=32,
+        reverse=True,
+        scale=None,
+        cu_seqlens=None,
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=87,
+    ),
 ]
 
 
 def _case_id(c):
+    if isinstance(c, ParameterSet):
+        c = c.values[0]
     parts = [f"B{c['B']}_T{c['T']}_H{c['H']}_K{c['K']}"]
     if c.get("cu_seqlens"):
         parts.append(f"segs{len(c['cu_seqlens']) - 1}")
@@ -125,6 +294,14 @@ def _torch_to_jax(t: torch.Tensor) -> jax.Array:
 def _to_torch_dtype(dtype) -> torch.dtype | None:
     if dtype is None:
         return None
+    _JAX_TO_TORCH = {
+        jnp.float32: torch.float32,
+        jnp.float16: torch.float16,
+        jnp.bfloat16: torch.bfloat16,
+        jnp.float64: torch.float64,
+    }
+    if dtype in _JAX_TO_TORCH:
+        return _JAX_TO_TORCH[dtype]
     return torch.from_numpy(np.empty((), dtype=np.dtype(dtype))).dtype
 
 
