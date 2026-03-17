@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-2x2x1-kelai
+  annotations:
+    gke-gcsfuse/volumes: "true"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1
+  containers:
+    - name: tpu-job
+      image: python:3.13
+      ports:
+        - containerPort: 8431
+      securityContext:
+        privileged: false
+      command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # 1. 准备 SSH 环境 (Secret 挂载通常是只读的，所以需要 cp 到家目录)
+          mkdir -p ~/.ssh
+          cp /etc/ssh-key/id_ed25519 ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          # 2. 扫描 GitHub 指纹避免交互式确认
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          pip install -U --pre jax jaxlib libtpu requests -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install uv
+
+          # git clone https://github.com/primatrix/ant-pretrain.git
+          # cd ant-pretrain && git checkout feat/kda-with-kernel
+          python -c 'import jax; print("Total TPU devices (cores):", jax.device_count())'
+
+          sleep infinity
+
+      resources:
+        requests:
+          google.com/tpu: 4
+        limits:
+          google.com/tpu: 4
+      volumeMounts:
+        - name: ssh-key-volume
+          mountPath: /etc/ssh-key
+          readOnly: true
+        - name: gcs-fuse-csi-ephemeral
+          mountPath: /data
+          readOnly: false
+  serviceAccountName: gcs-account
+  volumes:
+    - name: ssh-key-volume
+      secret:
+        secretName: ssh-key-secret # 必须与你 kubectl create secret 时起的名字一致
+        defaultMode: 0600 # 尝试直接设定权限 (虽然 cp 方式更保险)
+    - name: gcs-fuse-csi-ephemeral
+      csi:
+        driver: gcsfuse.csi.storage.gke.io
+        readOnly: false
+        volumeAttributes:
+          bucketName: inference-model-storage-sgl
+          mountOptions: "implicit-dirs"

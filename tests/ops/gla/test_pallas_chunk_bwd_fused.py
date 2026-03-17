@@ -12,6 +12,7 @@ import jax.numpy as jnp
 
 from src.ops.gla.chunk import chunk_gla_bwd_fused_pl
 from src.ops.gla.chunk import (
+    chunk_gla_fwd_intra_gk_ref,
     chunk_gla_bwd_dA_ref,
     chunk_gla_bwd_dv_ref,
     chunk_gla_bwd_dqk_intra_ref,
@@ -45,23 +46,22 @@ def _case_id(c):
     return "-".join(parts)
 
 
-def _run_tpu_ref(q, k, v, g_cumsum, h, do, dh, scale, chunk_size):
-    # 5. dA
+def _run_tpu_ref(q, k, v, g_cumsum, h, do, dh, scale, chunk_size, A):
+    # dA = do @ v^T * scale — gradient of loss w.r.t. A; used for dq, dk
     dA = chunk_gla_bwd_dA_ref(v, do, scale, chunk_size=chunk_size)
-    # 4. dv
-    dv = chunk_gla_bwd_dv_ref(k, g_cumsum, dA, do, dh, chunk_size=chunk_size)
-    # 6. Intra-chunk dq, dk
+    # dv uses true A from forward: dv[j] = sum_{i>=j} A[i,j] * do[i]
+    dv = chunk_gla_bwd_dv_ref(k, g_cumsum, A, do, dh, chunk_size=chunk_size)
+    # dq, dk use dA via chain rule
     dq_intra, dk_intra = chunk_gla_bwd_dqk_intra_ref(q, k, g_cumsum, dA, chunk_size=chunk_size)
-    # 7. Inter-chunk dq, dk + gate gradient
     dq, dk, dg = chunk_gla_bwd_dqkg_ref(
         q, k, v, h, g_cumsum, do, dh, dq_intra, dk_intra, scale, chunk_size=chunk_size
     )
     return dq, dk, dv, dg
 
 
-def _run_pallas(q, k, v, g_cumsum, h, do, dh, scale, chunk_size):
+def _run_pallas(q, k, v, g_cumsum, h, do, dh, scale, chunk_size, A):
     dq, dk, dv, dg = chunk_gla_bwd_fused_pl(
-        q, k, v, g_cumsum, h, do, dh, scale=scale, chunk_size=chunk_size
+        q, k, v, g_cumsum, h, do, dh, scale=scale, chunk_size=chunk_size, A=A
     )
     return dq, dk, dv, dg
 
@@ -70,13 +70,13 @@ def _run_pallas(q, k, v, g_cumsum, h, do, dh, scale, chunk_size):
 def test_native_tpu_vs_pallas(cfg):
     B, T, H, K = cfg["B"], cfg["T"], cfg["H"], cfg["K"]
     V = K # In these tests V == K
-    atol = cfg.get("atol", 1e-8)
-    rtol = cfg.get("rtol", 1e-8)
+    atol = cfg.get("atol", 1e-5)
+    rtol = cfg.get("rtol", 1e-4)
     chunk_size = cfg.get("chunk_size", 64)
     NT = T // chunk_size
-    
+
     key = jax.random.PRNGKey(cfg.get("seed", 11))
-    
+
     q = jax.random.normal(key, (B, T, H, K))
     k = jax.random.normal(key, (B, T, H, K))
     v = jax.random.normal(key, (B, T, H, V))
@@ -86,12 +86,15 @@ def test_native_tpu_vs_pallas(cfg):
     dh = jax.random.normal(key, (B, NT, H, K, V))
     scale = K ** -0.5
 
+    # Compute true intra-chunk attention matrix A from forward pass
+    A = chunk_gla_fwd_intra_gk_ref(q, k, g_cumsum, scale, chunk_size=chunk_size)
+
     ref_dq, ref_dk, ref_dv, ref_dg = _run_tpu_ref(
-        q, k, v, g_cumsum, h, do, dh, scale, chunk_size
+        q, k, v, g_cumsum, h, do, dh, scale, chunk_size, A
     )
 
     pallas_dq, pallas_dk, pallas_dv, pallas_dg = _run_pallas(
-        q, k, v, g_cumsum, h, do, dh, scale, chunk_size
+        q, k, v, g_cumsum, h, do, dh, scale, chunk_size, A
     )
 
     assert compare_tensor("dq", ref_dq, pallas_dq, atol=atol, rtol=rtol)

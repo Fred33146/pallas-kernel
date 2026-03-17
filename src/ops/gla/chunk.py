@@ -947,6 +947,76 @@ def chunk_gla_bwd(
     return dq, dk, dv, dg, dh0
 
 
+def chunk_gla_bwd_with_pl(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    g_cumsum: jax.Array | None,
+    scale: float,
+    initial_state: jax.Array | None,
+    h: jax.Array | None,
+    A: jax.Array | None,
+    do: jax.Array,
+    dht: jax.Array | None,
+    cu_seqlens: jax.Array | None = None,
+    chunk_size: int = 64,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """Chunk GLA backward orchestrator using Pallas kernels."""
+    from src.ops.common.chunk_h import chunk_bwd_dh_kernel
+
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = chunk_size
+
+    assert T % C == 0, "T must be a multiple of chunk_size for chunk_gla_bwd_with_pl"
+    assert (cu_seqlens is None) or (cu_seqlens % C == 0).all(), (
+        "cu_seqlens must be multiples of chunk_size for chunk_gla_bwd_with_pl"
+    )
+
+    # 1. Chunk-local cumsum
+    if g_cumsum is None:
+        g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
+
+    # 2. Forward replay to get h
+    if h is None:
+        h, _ = chunk_fwd_h_kernel(
+            k,
+            v,
+            gk=g_cumsum,
+            h0=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_size=C,
+        )
+        if cu_seqlens is None:
+            h = h.reshape(B, T // C, H, K, V)
+
+    # 3. Backward hidden state gradients
+    dh, dh0 = chunk_bwd_dh_kernel(
+        q,
+        k,
+        v,
+        gk=g_cumsum,
+        do=do,
+        dht=dht,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=C,
+    )
+    if cu_seqlens is None:
+        dh = dh.reshape(B, T // C, H, K, V)
+        if dh0 is not None:
+            dh0 = dh0.reshape(B, H, K, V)
+
+    # 4. Fused backward pass for dq, dk, dv, dg
+    dq, dk, dv, dg = chunk_gla_bwd_fused_pl(
+        q, k, v, g_cumsum, h, do, dh, scale=scale, chunk_size=C
+    )
+
+    return dq, dk, dv, dg, dh0
+
+
 # =============================================================================
 # Orchestrator: chunk_gla_fwd
 # =============================================================================
@@ -1255,7 +1325,7 @@ def chunk_gla_fwd_o_gk(
 # =============================================================================
 
 def chunk_gla_bwd_fused_kernel(
-    q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref,
+    q_ref, k_ref, v_ref, g_ref, h_ref, a_ref, do_ref, dh_ref,
     dq_ref, dk_ref, dv_ref, dg_ref,
     *,
     BT: int,
@@ -1266,19 +1336,21 @@ def chunk_gla_bwd_fused_kernel(
     b_v = v_ref[0, 0]
     b_g = g_ref[0, 0].astype(jnp.float32)
     b_h = h_ref[0, 0].astype(jnp.float32)
+    b_a = a_ref[0, 0].astype(jnp.float32)  # [BT, BT] — true intra-chunk attention
     b_do = do_ref[0, 0]
     b_dh = dh_ref[0, 0].astype(jnp.float32)
-    
+
     b_gn = b_g[BT - 1, :]
-    
-    # 1. dA
+
+    # 1. dA = do @ v^T * scale  (gradient of loss w.r.t. A; used for dq, dk)
     b_A_do = b_do.astype(b_v.dtype)
     b_dA = jnp.dot(b_A_do, b_v.T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * scale
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_dA = jnp.where(mask, b_dA, 0.0)
 
-    # 2. dv
-    b_dv_intra = jnp.dot(b_dA.T.astype(b_do.dtype), b_do, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    # 2. dv — intra uses true A (not dA): dv[j] = sum_{i>=j} A[i,j] * do[i]
+    b_a_masked = jnp.where(mask, b_a, 0.0)
+    b_dv_intra = jnp.dot(b_a_masked.T.astype(b_do.dtype), b_do, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     k_decay = (b_k * jnp.exp(b_gn[None, :] - b_g)).astype(b_k.dtype)
     b_dv_inter = jnp.dot(k_decay, b_dh.astype(b_k.dtype), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     b_dv = b_dv_intra + b_dv_inter
@@ -1321,12 +1393,16 @@ def chunk_gla_bwd_fused_pl(
     dh: jax.Array, # [B, NT, H, K, V]
     scale: float,
     chunk_size: int,
+    A: jax.Array | None = None,  # [B, T, H, chunk_size] — intra-chunk attention from fwd
 ):
     B, T, H, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
     NT = T // BT
     total_NT = B * NT
+
+    if A is None:
+        A = chunk_gla_fwd_intra_gk_ref(q, k, g, scale, chunk_size=BT)
 
     # Reshape
     _q = q.reshape(B, NT, BT, H, K).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, K)
@@ -1336,12 +1412,15 @@ def chunk_gla_bwd_fused_pl(
     _do = do.reshape(B, NT, BT, H, V).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, V)
     _h = h.transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
     _dh = dh.transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
+    # A: [B, T, H, BT] -> [B, NT, BT, H, BT] -> [H, total_NT, BT, BT]
+    _A = A.reshape(B, NT, BT, H, BT).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, BT)
 
     # BlockSpecs
     grid = (H, total_NT)
     spec_K = pl.BlockSpec([1, 1, BT, K], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_V = pl.BlockSpec([1, 1, BT, V], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_h = pl.BlockSpec([1, 1, K, V], index_map=lambda h, nt: (h, nt, 0, 0))
+    spec_A = pl.BlockSpec([1, 1, BT, BT], index_map=lambda h, nt: (h, nt, 0, 0))
 
     dq_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], q.dtype)
     dk_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], k.dtype)
@@ -1352,12 +1431,12 @@ def chunk_gla_bwd_fused_pl(
         functools.partial(chunk_gla_bwd_fused_kernel, BT=BT, scale=scale),
         grid=grid,
         out_shape=[dq_shape, dk_shape, dv_shape, dg_shape],
-        in_specs=[spec_K, spec_K, spec_V, spec_K, spec_h, spec_V, spec_h],
+        in_specs=[spec_K, spec_K, spec_V, spec_K, spec_h, spec_A, spec_V, spec_h],
         out_specs=[spec_K, spec_K, spec_V, spec_K],
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=32 * 1024 * 1024, # 32 MB limit to be safe
         ),
-    )(_q, _k, _v, _g, _h, _do, _dh)
+    )(_q, _k, _v, _g, _h, _A, _do, _dh)
 
     # Post-process
     def _unreshape(x, shape):
