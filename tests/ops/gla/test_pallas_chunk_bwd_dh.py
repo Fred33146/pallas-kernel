@@ -16,7 +16,7 @@ from tests.src.ops.gla.chunk import (
     chunk_bwd_dh as cpu_chunk_bwd_dh,
     chunk_local_cumsum as cpu_chunk_local_cumsum,
 )
-from src.ops.common.chunk_h import chunk_bwd_dh_kernel as jax_chunk_bwd_dh
+from src.ops.common.chunk_h import chunk_bwd_dh_ref as jax_chunk_bwd_dh
 from src.ops.gla.chunk import chunk_local_cumsum_ref as jax_chunk_local_cumsum
 from tests.utils import compare_tensor
 

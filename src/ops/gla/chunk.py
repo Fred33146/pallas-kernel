@@ -723,12 +723,10 @@ def chunk_gla_bwd_dqkg_ref(
     # dg_raw = q * dq_total - k * dk_total
     dg_raw = q_c * dq_total - k_c * dk_total  # [B, NT, C, H, K]
 
-    rev_cumsum = jnp.cumsum(dg_raw[:, :, ::-1, :, :], axis=2)[:, :, ::-1, :, :]
-    # jax.debug.print("dg_raw: {dg_raw_max}, {dg_raw_min}, rev_cumsum: {rev_cumsum_max}, {rev_cumsum_min}, dgk_inter: {dgk_inter_max}, {dgk_inter_min}", dg_raw_max=dg_raw.max(), dg_raw_min=dg_raw.min(), rev_cumsum_max=rev_cumsum.max(), rev_cumsum_min=rev_cumsum.min(), dgk_inter_max=dgk_inter.max(), dgk_inter_min=dgk_inter.min())
 
     # Reverse cumsum over time dimension within each chunk
     dg = (
-        rev_cumsum
+        jnp.cumsum(dg_raw[:, :, ::-1, :, :], axis=2)[:, :, ::-1, :, :]
         + dgk_inter[:, :, None, :, :]
     )
 
@@ -1375,15 +1373,12 @@ def chunk_gla_bwd_fused_kernel(
     
     # 5. dg
     dgk_inter = jnp.exp(b_gn) * jnp.sum(b_h * b_dh, axis=1) + jnp.sum(b_dk_inter * b_k.astype(jnp.float32), axis=0)
-    # jax.debug.print("dgk_inter: {dgk_inter_max}, {dgk_inter_min}", dgk_inter_max=dgk_inter.max(), dgk_inter_min=dgk_inter.min())
     dg_raw = b_q.astype(jnp.float32) * b_dq - b_k.astype(jnp.float32) * b_dk
-    # jax.debug.print("dg_raw: {dg_raw_max}, {dg_raw_min}", dg_raw_max=dg_raw.max(), dg_raw_min=dg_raw.min())
     
     # Use upper triangular matrix multiplication for reverse cumsum
     mask_upper = jnp.arange(BT)[None, :] >= jnp.arange(BT)[:, None]
     M_upper = jnp.where(mask_upper, 1.0, 0.0).astype(jnp.float32)
     dg_rev_cumsum = jnp.dot(M_upper, dg_raw, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    # jax.debug.print("dg_rev_cumsum: {dg_rev_cumsum_max}, {dg_rev_cumsum_min}", dg_rev_cumsum_max=dg_rev_cumsum.max(), dg_rev_cumsum_min=dg_rev_cumsum.min())
     
     b_dg = dg_rev_cumsum + dgk_inter[None, :]
     dg_ref[0, 0] = b_dg.astype(dg_ref.dtype)
