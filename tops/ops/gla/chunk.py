@@ -809,7 +809,8 @@ def chunk_gla_bwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g: jax.Array,
+    g: jax.Array | None,
+    g_gamma: jax.Array | None,
     g_cumsum: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None,
@@ -833,7 +834,8 @@ def chunk_gla_bwd(
         q:  [B, T, H, K]
         k:  [B, T, H, K]
         v:  [B, T, H, V]
-        g:  [B, T, H, K] — raw log-space gates
+        g:  [B, T, H, K] — raw log-space gates (or None if g_gamma is used)
+        g_gamma: broadcastable to [B, T, H, K] or None — constant gate
         g_cumsum: [B, T, H, K] or None — pre-computed chunk-local cumsum
         scale: scaling factor
         initial_state: [B, H, K, V] or [N, H, K, V] (varlen) or None
@@ -854,6 +856,16 @@ def chunk_gla_bwd(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+
+    # Record if g was originally None
+    g_orig = g
+
+    # Broadcast g_gamma into full g if g is not provided
+    if g is None:
+        if g_gamma is not None:
+            g = jnp.broadcast_to(g_gamma, q.shape)
+        else:
+            g = jnp.zeros_like(q)
 
     # --- padding ---
     orig_seqlens = None
@@ -945,6 +957,16 @@ def chunk_gla_bwd(
         dv = dv[:, :T]
         dg = dg[:, :T]
 
+    if g_orig is None and g_gamma is not None:
+        # Sum-reduce dg to match g_gamma's shape
+        for i, (d_full, d_gamma) in enumerate(zip(dg.shape[::-1], g_gamma.shape[::-1])):
+            if d_full != d_gamma:
+                dg = jnp.sum(dg, axis=len(dg.shape) - 1 - i, keepdims=True)
+        missing_dims = len(dg.shape) - len(g_gamma.shape)
+        if missing_dims > 0:
+            dg = jnp.sum(dg, axis=tuple(range(missing_dims)))
+        dg = dg.reshape(g_gamma.shape)
+
     return dq, dk, dv, dg, dh0
 
 
@@ -952,7 +974,8 @@ def chunk_gla_bwd_with_pl(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g: jax.Array,
+    g: jax.Array | None,
+    g_gamma: jax.Array | None,
     g_cumsum: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None,
@@ -969,6 +992,16 @@ def chunk_gla_bwd_with_pl(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+
+    # Record if g was originally None
+    g_orig = g
+
+    # Broadcast g_gamma into full g if g is not provided
+    if g is None:
+        if g_gamma is not None:
+            g = jnp.broadcast_to(g_gamma, q.shape)
+        else:
+            g = jnp.zeros_like(q)
 
     assert T % C == 0, "T must be a multiple of chunk_size for chunk_gla_bwd_with_pl"
     assert (cu_seqlens is None) or (cu_seqlens % C == 0).all(), (
@@ -1015,6 +1048,16 @@ def chunk_gla_bwd_with_pl(
         q, k, v, g_cumsum, h, do, dh, scale=scale, chunk_size=C
     )
 
+    if g_orig is None and g_gamma is not None:
+        # Sum-reduce dg to match g_gamma's shape
+        for i, (d_full, d_gamma) in enumerate(zip(dg.shape[::-1], g_gamma.shape[::-1])):
+            if d_full != d_gamma:
+                dg = jnp.sum(dg, axis=len(dg.shape) - 1 - i, keepdims=True)
+        missing_dims = len(dg.shape) - len(g_gamma.shape)
+        if missing_dims > 0:
+            dg = jnp.sum(dg, axis=tuple(range(missing_dims)))
+        dg = dg.reshape(g_gamma.shape)
+
     return dq, dk, dv, dg, dh0
 
 
@@ -1027,7 +1070,8 @@ def chunk_gla_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g: jax.Array,
+    g: jax.Array | None,
+    g_gamma: jax.Array | None,
     g_cumsum: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None,
@@ -1053,6 +1097,12 @@ def chunk_gla_fwd(
     orig_seqlens = None
     padded_seqlens = None
 
+    if g is None:
+        if g_gamma is not None:
+            g = jnp.broadcast_to(g_gamma, q.shape)
+        else:
+            g = jnp.zeros_like(q)
+
     if cu_seqlens is not None:
         assert B == 1
         [q, k, v, g], cu_seqlens, orig_seqlens, padded_seqlens = (
@@ -1071,8 +1121,10 @@ def chunk_gla_fwd(
         g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
 
     h, ht = chunk_fwd_h_kernel(
-        k,
-        v,
+        k=k,
+        v=v,
+        g=None,
+        g_gamma=None,
         gk=g_cumsum,
         h0=initial_state,
         output_final_state=output_final_state,
@@ -1112,7 +1164,8 @@ def chunk_gla(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g: jax.Array,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
     scale: float | None = None,
     initial_state: jax.Array | None = None,
     output_final_state: bool = False,
@@ -1123,13 +1176,19 @@ def chunk_gla(
 
     Splits the sequence into blocks of chunk_size and computes in parallel
     within each block, propagating hidden states across blocks.
-    Mathematically equivalent to naive_recurrent_gla.
+
+    Either ``g`` or ``g_gamma`` (or both) may be provided:
+    - ``g``: [B, T, H, K] — per-step log-space gates.
+    - ``g_gamma``: broadcastable to [B, T, H, K] — constant gate that is
+      broadcast across the sequence.  Used only when ``g is None``.
+    If neither is given, gates default to zero (no decay).
 
     Args:
         q: [B, T, H, K]
         k: [B, T, H, K]
         v: [B, T, H, V]
-        g: [B, T, H, K] — gates (log-space, after logsigmoid)
+        g: [B, T, H, K] or None — gates (log-space, after logsigmoid)
+        g_gamma: broadcastable to [B, T, H, K] or None — constant gate
         scale: scaling factor, default K^{-0.5}
         initial_state: [N, H, K, V]
         output_final_state: whether to return final state
@@ -1141,7 +1200,11 @@ def chunk_gla(
         final_state: [N, H, K, V] or None
     """
     dtype = q.dtype
-    q, k, v, g = (x.astype(jnp.float32) for x in (q, k, v, g))
+    q, k, v = (x.astype(jnp.float32) for x in (q, k, v))
+    if g is not None:
+        g = g.astype(jnp.float32)
+    if g_gamma is not None:
+        g_gamma = g_gamma.astype(jnp.float32)
     B, T, H, K = q.shape
 
     if scale is None:
@@ -1152,6 +1215,7 @@ def chunk_gla(
         k,
         v,
         g,
+        g_gamma=g_gamma,
         g_cumsum=None,
         scale=scale,
         initial_state=initial_state,
@@ -1373,16 +1437,16 @@ def chunk_gla_bwd_fused_kernel(
     b_dk_inter = jnp.dot(b_v, b_dh.astype(b_v.dtype).T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * jnp.exp(b_gn[None, :] - b_g)
     b_dk = b_dk_intra + b_dk_inter
     dk_ref[0, 0] = b_dk.astype(dk_ref.dtype)
-    
+
     # 5. dg
     dgk_inter = jnp.exp(b_gn) * jnp.sum(b_h * b_dh, axis=1) + jnp.sum(b_dk_inter * b_k.astype(jnp.float32), axis=0)
     dg_raw = b_q.astype(jnp.float32) * b_dq - b_k.astype(jnp.float32) * b_dk
-    
+
     # Use upper triangular matrix multiplication for reverse cumsum
     mask_upper = jnp.arange(BT)[None, :] >= jnp.arange(BT)[:, None]
     M_upper = jnp.where(mask_upper, 1.0, 0.0).astype(jnp.float32)
     dg_rev_cumsum = jnp.dot(M_upper, dg_raw, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    
+
     b_dg = dg_rev_cumsum + dgk_inter[None, :]
     dg_ref[0, 0] = b_dg.astype(dg_ref.dtype)
 
@@ -1453,5 +1517,5 @@ def chunk_gla_bwd_fused_pl(
     dk = _unreshape(dk, [B, T, H, K])
     dv = _unreshape(dv, [B, T, H, V])
     dg = _unreshape(dg, [B, T, H, K])
-    
+
     return dq, dk, dv, dg
