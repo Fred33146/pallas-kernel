@@ -19,6 +19,7 @@ def _chunk_fwd_h_kernel(
     v_ref,  # [1, T_sum, BV]
     h0_ref,  # [N, 1, BK, BV]
     gk_ref,  # [1, T_sum, BK]
+    g_gamma,  # [H]
     cu_seqlens_ref,  # [num_seq+1]
     chunk_to_seq,  # [T_sum/BT]
     h_ref,  # [NS, 1, BK, BV]
@@ -34,17 +35,25 @@ def _chunk_fwd_h_kernel(
     b_h_start = jnp.zeros((BK, BV), dtype=jnp.float32)
     b_h = jnp.zeros((BK, BV), dtype=jnp.float32)
     seq_idx = jnp.array(0, dtype=jnp.int32)
+    i_in_seq = jnp.array(0, dtype=jnp.int32)
+
+    if g_gamma is not None:
+        head_index = pl.program_id(0)
+        b_g = g_gamma[head_index] * (jnp.arange(0, BT) + 1)
 
     def body(i_t, carry):
-        b_h, seq_idx = carry
+        b_h, seq_idx, i_in_seq = carry
         t0 = i_t * BT
 
         seq_idx = chunk_to_seq[i_t]
 
         bos = cu_seqlens_ref[seq_idx]
+        eos = cu_seqlens_ref[seq_idx + 1]
 
         # reset h state
         def reset_state(_):
+            nonlocal i_in_seq
+            i_in_seq = 0
             if h0_ref is not None:
                 return h0_ref[seq_idx, 0]
             else:
@@ -67,17 +76,21 @@ def _chunk_fwd_h_kernel(
 
         k = k_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT,BK]
         v = v_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT,BV]
+
+        if g_gamma is not None:
+            b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - bos - i_in_seq * BT)
+            b_h *= jnp.exp(b_g_last)
+            v = (v * jnp.exp(b_g_last - b_g)[:, None]).astype(v.dtype)
+
         if gk_ref is not None:
             gk = gk_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT,BK]
-            g_last = gk[BT-1, :]
+            g_last = gk[BT - 1, :]
             decay = jnp.exp(g_last)
             b_h = b_h * decay[:, None]  # [BK, BV] * [BK,1]
             k = (k * jnp.exp(g_last[None, :] - gk)).astype(k.dtype)
 
         # state update
         b_h = b_h + jax.lax.dot(k.T, v, precision=lax.Precision.HIGHEST)
-
-        eos = cu_seqlens_ref[seq_idx + 1]
 
         is_last_chunk = t0 + BT >= eos
 
@@ -87,9 +100,10 @@ def _chunk_fwd_h_kernel(
             return None
 
         lax.cond(is_last_chunk, write_final, lambda _: None, operand=None)
-        return (b_h, seq_idx)
+        i_in_seq += 1
+        return (b_h, seq_idx, i_in_seq)
 
-    b_h, seq_idx = lax.fori_loop(0, NT, body, (b_h, seq_idx))
+    b_h, seq_idx, i_in_seq = lax.fori_loop(0, NT, body, (b_h, seq_idx, i_in_seq))
 
 
 def check_chunk_fwd(x):
@@ -124,7 +138,6 @@ def chunk_fwd_h_kernel(
 ):
     check_chunk_fwd(g)
     check_chunk_fwd(gv)
-    check_chunk_fwd(g_gamma)
     # todo: tune bk and bv for bast performance
     BK = 128
     BV = 128
@@ -204,6 +217,11 @@ def chunk_fwd_h_kernel(
     else:
         in_specs.append(None)
 
+    if g_gamma is not None:
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    else:
+        in_specs.append(None)
+
     in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
     in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
     kernel = functools.partial(
@@ -229,7 +247,7 @@ def chunk_fwd_h_kernel(
             ),
             vmem_limit_bytes=128 * 1024 * 1024,
         ),
-    )(k, v, h0, gk, cu_seqlens, chunk_to_seq)
+    )(k, v, h0, gk, g_gamma, cu_seqlens, chunk_to_seq)
     if output_final_state:
         return h, ht
     return h, None
@@ -238,6 +256,7 @@ def chunk_fwd_h_kernel(
 def chunk_fwd_h_ref(
     k: jax.Array,
     v: jax.Array,
+    g_gamma: jax.Array | None = None,
     gk: jax.Array | None = None,
     h0: jax.Array | None = None,
     output_final_state: bool = False,
@@ -292,6 +311,11 @@ def chunk_fwd_h_ref(
         if h0 is not None:
             h = h + h0[i_n].astype(jnp.float32)
 
+        if g_gamma is not None:
+            b_g = jax.lax.dot(
+                (jnp.arange(0, C) + 1)[:, None], g_gamma[None, :]
+            )  # [C, H]
+
         NT = (eos - bos) // C
         for i_t in range(NT):
             if cu_seqlens_cpu is None:
@@ -300,6 +324,14 @@ def chunk_fwd_h_ref(
                 h_all = h_all.at[0, bos // C + i_t].set(h.astype(h_all.dtype))
             b_k = k[bos + i_t * C : bos + (i_t + 1) * C]  # [C, H, K]
             b_v = v[bos + i_t * C : bos + (i_t + 1) * C]  # [C, H, V]
+
+            if g_gamma is not None:
+                b_g_last = g_gamma * jnp.minimum(C, (eos - bos) - i_t * C)  # [H]
+                h *= jnp.exp(b_g_last[:, None, None])  # (H, K, V)
+                b_v = (b_v * jnp.exp(b_g_last[None, :] - b_g)[:, :, None]).astype(
+                    b_v.dtype
+                )
+
             if gk is not None:
                 b_gk = gk[bos + i_t * C : bos + (i_t + 1) * C]  # [C, H, K]
                 b_gk_last = b_gk[-1]  # [H, K]
@@ -368,7 +400,11 @@ def chunk_bwd_dh_ref(
     gk = gk.reshape(-1, H, K) if gk is not None else None
 
     dh_all = jnp.zeros([B, NT, H, K, V], dtype=jnp.float32)
-    dh0_all = jnp.zeros([N, H, K, V], dtype=jnp.float32) if (h0 is not None or dht is not None) else None
+    dh0_all = (
+        jnp.zeros([N, H, K, V], dtype=jnp.float32)
+        if (h0 is not None or dht is not None)
+        else None
+    )
 
     for i_n in range(N):
         if not is_varlen:
@@ -388,7 +424,7 @@ def chunk_bwd_dh_ref(
             ti = bos // C + i_t if is_varlen else i_t
             dh_all = dh_all.at[bi, ti].set(dh)
 
-            b_q = q[bos + i_t * C : bos + (i_t + 1) * C]   # [C, H, K]
+            b_q = q[bos + i_t * C : bos + (i_t + 1) * C]  # [C, H, K]
             b_do = do[bos + i_t * C : bos + (i_t + 1) * C]  # [C, H, V]
 
             if gk is not None:
@@ -401,7 +437,8 @@ def chunk_bwd_dh_ref(
 
             # contract over C (dim 0) and H (dim 1): [C,H,K]^T @ [C,H,V] -> [H,K,V]
             dh = dh + lax.dot_general(
-                b_q_hat, b_do,
+                b_q_hat,
+                b_do,
                 dimension_numbers=(((0,), (0,)), ((1,), (1,))),
                 precision=lax.Precision.HIGHEST,
                 preferred_element_type=jnp.float32,

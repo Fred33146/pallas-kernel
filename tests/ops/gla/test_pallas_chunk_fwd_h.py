@@ -67,6 +67,7 @@ def _to_jax_cu_seqlens(cu_seqlens) -> jax.Array | None:
 def _run_tpu(
     k,
     v,
+    g_gamma=None,
     gk=None,
     h0=None,
     chunk_size=64,
@@ -78,6 +79,7 @@ def _run_tpu(
     h, ht = chunk_fwd_h_ref(
         k,
         v,
+        g_gamma=g_gamma,
         gk=gk,
         h0=h0,
         chunk_size=chunk_size,
@@ -91,6 +93,7 @@ def _run_tpu(
 def _run_pallas(
     k,
     v,
+    g_gamma=None,
     gk=None,
     h0=None,
     chunk_size=64,
@@ -101,6 +104,7 @@ def _run_pallas(
     h, ht = chunk_fwd_h_kernel(
         k,
         v,
+        g_gamma=g_gamma,
         gk=gk,
         h0=h0,
         chunk_size=chunk_size,
@@ -134,10 +138,11 @@ def test_native_tpu_vs_pallas(cfg):
     v = jax.random.normal(key, (B, T, H, K))
     gk = jax.random.normal(key, (B, T, H, K))
     h0 = jax.random.normal(key, (N, H, K, K))
-
+    g_gamma = -(8 / H * (1 - 1 / 8)) * jnp.arange(H)
     h, ht = _run_tpu(
         k,
         v,
+        g_gamma=g_gamma,
         gk=gk,
         h0=h0,
         chunk_size=chunk_size,
@@ -147,6 +152,7 @@ def test_native_tpu_vs_pallas(cfg):
     pallas_h, pallas_ht = _run_pallas(
         k,
         v,
+        g_gamma=g_gamma,
         gk=gk,
         h0=h0,
         chunk_size=chunk_size,
