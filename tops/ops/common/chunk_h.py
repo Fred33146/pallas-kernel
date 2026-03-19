@@ -245,7 +245,7 @@ def chunk_fwd_h_kernel(
                 "arbitrary",
                 "arbitrary",
             ),
-            vmem_limit_bytes=128 * 1024 * 1024,
+            vmem_limit_bytes=32 * 1024 * 1024,
         ),
     )(k, v, h0, gk, g_gamma, cu_seqlens, chunk_to_seq)
     if output_final_state:
@@ -468,7 +468,7 @@ def _chunk_bwd_dh_kernel(
     BV = do_ref.shape[2]
     NT = pl.cdiv(T_sum, BT)
     NTS = BS // BT
-    
+
     b_dh_start = jnp.zeros((BK, BV), dtype=jnp.float32)
     b_dh = jnp.zeros((BK, BV), dtype=jnp.float32)
     seq_idx = jnp.array(0, dtype=jnp.int32)
@@ -478,10 +478,10 @@ def _chunk_bwd_dh_kernel(
         # 核心：反向遍历时间维度
         i_t = NT - 1 - step
         t0 = i_t * BT
-        
+
         seq_idx = chunk_to_seq[i_t]
         eos = cu_seqlens_ref[seq_idx + 1]
-        
+
         # 1. 序列末尾处理：如果当前块碰到了 sequence 的末尾，重置 dh 为 dht 或者全0
         is_last_chunk = (t0 + BT >= eos)
         def reset_state(_):
@@ -490,34 +490,34 @@ def _chunk_bwd_dh_kernel(
             else:
                 return b_dh_start
         b_dh = lax.cond(is_last_chunk, reset_state, lambda _: b_dh, operand=None)
-        
+
         # 2. 存储传入当前 chunk 的梯度 dh (对应于 dh_all.at[..., i_t].set(dh))
         i_s = i_t // NTS
         def store_fn(_):
             dh_ref[i_s, 0] = b_dh
         lax.cond((i_t % NTS) == 0, store_fn, lambda _: None, operand=None)
-        
+
         # 加载 HBM 数据到 SRAM
         b_q  = q_ref[0, pl.dslice(t0, BT), slice(None)]    # [BT, BK]
         b_do = do_ref[0, pl.dslice(t0, BT), slice(None)]   # [BT, BV]
-        
+
         if gk_ref is not None:
             b_gk = gk_ref[0, pl.dslice(t0, BT), slice(None)] # [BT, BK]
             g_last = b_gk[BT - 1, :]
-            
+
             # dh = dh * exp(g_last) (时序衰减的反向)
             b_dh = b_dh * jnp.exp(g_last)[:, None]  # [BK, BV] * [BK, 1]
-            
+
             # 计算 q_hat = q * exp(gk) * scale
             b_q_hat = (b_q * jnp.exp(b_gk) * scale).astype(b_q.dtype)
         else:
             b_q_hat = (b_q * scale).astype(b_q.dtype)
-            
+
         # 3. 计算并累积本 chunk 的隐状态梯度贡献
         # b_q_hat.T @ b_do -> [BK, BT] @ [BT, BV] -> [BK, BV]
         b_dh = b_dh + jax.lax.dot(b_q_hat.T, b_do,precision=lax.Precision.HIGHEST,
                 preferred_element_type=jnp.float32,)
-        
+
         # 4. 序列起始处理：如果到了 sequence 的头部，写入 dh0
         bos = cu_seqlens_ref[seq_idx]
         is_first_chunk = (t0 == bos)
@@ -525,7 +525,7 @@ def _chunk_bwd_dh_kernel(
             if dh0_ref is not None:
                 dh0_ref[seq_idx, 0] = b_dh
         lax.cond(is_first_chunk, write_dh0, lambda _: None, operand=None)
-        
+
         return (b_dh, seq_idx)
 
     lax.fori_loop(0, NT, body, (b_dh, seq_idx))
@@ -557,7 +557,7 @@ def chunk_bwd_dh_kernel(
     BK, BV = 128, 128
     B, T, H, K = q.shape
     V = do.shape[-1]
-    
+
     assert K % 128 == 0, "K % 128 must equal to 0."
     assert V % 128 == 0, "V % 128 must equal to 0."
     assert T % chunk_size == 0, "T mod chunk_size must equal to 0."
@@ -565,11 +565,11 @@ def chunk_bwd_dh_kernel(
     BT = chunk_size
     BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
-    
+
     T_sum = B * T
     if cu_seqlens is None:
         cu_seqlens = jnp.arange(T_sum + 1, step=T)
-    
+
     chunk_to_seq = build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
     N, NS = len(cu_seqlens) - 1, T_sum // BS
 
@@ -600,12 +600,12 @@ def chunk_bwd_dh_kernel(
         pl.BlockSpec((1, T_sum, BK), idx_map_K),
         pl.BlockSpec((1, T_sum, BV), idx_map_V),
     ]
-    
+
     if dht is not None:
         in_specs.append(pl.BlockSpec((N, 1, BK, BV), idx_map_state))
     else:
         in_specs.append(None)
-        
+
     if gk is not None:
         in_specs.append(pl.BlockSpec((1, T_sum, BK), idx_map_K))
     else:
@@ -632,5 +632,5 @@ def chunk_bwd_dh_kernel(
             vmem_limit_bytes=128 * 1024 * 1024, # 128 MB limit for VMEM
         ),
     )(q, do, dht, gk, cu_seqlens, chunk_to_seq)
-    
+
     return dh_all, dh0
