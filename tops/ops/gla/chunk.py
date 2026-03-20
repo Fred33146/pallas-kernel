@@ -416,6 +416,9 @@ def chunk_gla_fwd_intra_gk(
         out_shape=A_shape,
         in_specs=[spec, spec, spec],
         out_specs=A_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=32 * 1024 * 1024,
+        ),
     )(_q, _k, _g)
 
     # Post-reshape: [H, total_NT, BT, BT] -> [B, T, H, BT]
@@ -1010,7 +1013,13 @@ def chunk_gla_bwd_with_pl(
 
     # 1. Chunk-local cumsum
     if g_cumsum is None:
-        g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
+        if g_gamma is not None and cu_seqlens is None:
+            _, T_pad, _, _ = q.shape
+            pos = jnp.arange(1, C + 1, dtype=jnp.float32)
+            pos = jnp.tile(pos, T_pad // C).reshape(1, T_pad, 1, 1)
+            g_cumsum = jnp.broadcast_to(g_gamma * pos, q.shape)
+        else:
+            g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
 
     # 2. Forward replay to get h
     if h is None:
@@ -1118,7 +1127,17 @@ def chunk_gla_fwd(
         initial_state = pad_to_multiple(initial_state, [128, 128], axis=[2, 3], val=0)
 
     if g_cumsum is None:
-        g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
+        if g_gamma is not None and cu_seqlens is None:
+            # Constant g_gamma: compute chunk-local cumsum analytically.
+            # For constant g, cumsum within each chunk = g_gamma * [1, 2, ..., C].
+            # This avoids chunk_local_cumsum_vector whose pallas kernel uses
+            # no_block_spec and loads the full tensor into VMEM.
+            _, T_pad, _, _ = q.shape
+            pos = jnp.arange(1, C + 1, dtype=jnp.float32)
+            pos = jnp.tile(pos, T_pad // C).reshape(1, T_pad, 1, 1)
+            g_cumsum = jnp.broadcast_to(g_gamma * pos, q.shape)
+        else:
+            g_cumsum = chunk_local_cumsum_vector(g, C, cu_seqlens=cu_seqlens)
 
     h, ht = chunk_fwd_h_kernel(
         k=k,
@@ -1344,6 +1363,9 @@ def chunk_gla_fwd_o_gk_pl(
         out_shape=o_shape,
         in_specs=[q_spec, v_spec, g_spec, h_spec, A_spec],
         out_specs=o_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=32 * 1024 * 1024,
+        ),
     )(_q, _v, _g, _h, _A)
 
     # Post-process: (H, total_NT, BT, V) -> (B, T, H, V)
