@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-JAX/Pallas TPU kernels for Gated Linear Attention (GLA) operations. The project implements optimized GLA layers using Google's Pallas framework with support for TPU, GPU, and CPU.
+High-performance JAX/Pallas TPU and GPU kernels for modern neural network architectures. The project implements a variety of optimized operators and network layers using Google's Jax/Pallas framework, with support for TPU and CPU.
 
 ## Common Commands
 
@@ -35,25 +35,32 @@ pre-commit run --all-files   # Run manually
 
 ## Architecture
 
-```
-src/
-├── ops/gla/           # Core kernel implementations
-│   ├── naive.py       # Pure JAX reference (step-by-step recurrence)
-│   ├── chunk.py       # Chunked GLA with Pallas TPU kernels
-│   ├── fused_recurrent.py  # Fused recurrent Pallas kernel
-│   └── fused_chunk.py      # Wrapper for fused chunk ops
-├── layers/
-│   └── gla.py         # GatedLinearAttention layer (Flax NNX)
-└── modules/           # Building blocks: RMSNorm, ShortConvolution, FusedRMSNormGated
+The main workspace has been migrated to the `tops/` package. The structure is as follows:
 
-tests/
-├── ops/gla/           # Kernel tests (test_pallas_* vs test_torch_*)
-├── layers/            # Layer integration tests
-├── modules/           # Module unit tests
-└── src/               # CPU reference implementations mirroring src/
+```
+tops/                  # Core package
+├── ops/               # Core Operator / Kernel implementations
+│   ├── common/        # Shared common components (e.g., block handlers)
+│   ├── gla/           # Standard GLA kernels and operations
+│   └── simple_gla/    # Simplified GLA variant kernels
+├── layers/            # High-level Neural Network layers (Flax NNX)
+├── modules/           # Building blocks (e.g., RMSNorm, Layernorm, Convolutions)
+└── utils.py           # General utilities (shape assertions, alignment logic, etc.)
+
+tests/                 # Test modules
+├── ops/               # Core kernel tests (comparing Pallas against pure JAX/Torch references)
+├── layers/            # Neural network layer integration tests
+└── modules/           # Unit tests for independent module components
 ```
 
-### Key Concepts
+## Coding Standard Requirements
+
+For all public-facing APIs and functions in the project, the following two strict standards MUST be followed:
+
+1. **Comprehensive Docstrings:** All public functions must have a clear docstring in the header. The docstring MUST explicitly explain the **business semantics** of the function, and clearly detail the **tensor shape** and dimension meaning for every input and output argument.
+2. **Strict Input Assertions:** Before executing the main logic, all public functions MUST enforce strict constraints and validation on the shape and types of the input variables using `assert` instructions (or utilities like `assert_shape_or_none` from `tops.utils`). This guarantees failing fast and avoids hard-to-debug layout/dimension errors inside the low-level kernels.
+
+### Key Concepts Example (GLA)
 
 **GLA Recurrence Formula:**
 ```
@@ -61,23 +68,13 @@ h_t = h_{t-1} * exp(gk_t) + k_t^T @ v_t
 o_t = q_t^T @ h_t
 ```
 
-**Testing Pattern:** Each Pallas kernel has a corresponding CPU reference test. Tests compare optimized kernels against naive implementations with tolerance-based assertions.
-
-**Gate Types:**
-- `gk`: K-dimension gate `[B, T, H, K]` - standard GLA
-- `gv`: V-dimension gate `[B, T, H, V]` - optional
-- `g`: Scalar gate `[B, T, H]` - whole matrix
-
-## Third-Party Dependencies
-
-- `third_party/flash-linear-attention/` - Reference linear attention implementation (git submodule)
-- `third_party/tokamax/` - Related library (git submodule)
+**Testing Pattern:** Each Jax/Pallas kernel has a corresponding CPU reference test. Tests compare optimized kernels against naive implementations with tolerance-based assertions.
 
 ## Test Utilities
 
 ```python
 # tests/utils.py
-compare_tensor(name, gold, tensor, atol=1e-5, rtol=1e-5)
+compare_tensor(name, gold, tensor, atol=1e-5, rtol=1e-5, max_ulp=1)
 
 # tests/conftest.py provides fixtures:
 # - seed(): sets torch.manual_seed(42)
