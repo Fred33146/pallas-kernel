@@ -68,6 +68,7 @@ def compare_tensor(
     rtol=1e-5,
     max_ulp: int = 1,
     dtype=torch.bfloat16,
+    compare_dtype=np.float64,
 ) -> bool:
     if gold is None and tensor is None:
         print(f"[{name}] Both are None. MATCH.")
@@ -77,13 +78,17 @@ def compare_tensor(
         return False
 
     if isinstance(gold, torch.Tensor):
-        gold = gold.detach().to(torch.float32).cpu().numpy()
+        gold = gold.detach().cpu().to(torch.float64).numpy().astype(compare_dtype)
     if isinstance(tensor, torch.Tensor):
-        tensor = tensor.detach().to(torch.float32).cpu().numpy()
+        tensor = tensor.detach().cpu().to(torch.float64).numpy().astype(compare_dtype)
     if isinstance(gold, jax.Array):
-        gold = np.array(gold, dtype=np.float32)
+        gold = np.array(gold).astype(compare_dtype)
     if isinstance(tensor, jax.Array):
-        tensor = np.array(tensor, dtype=np.float32)
+        tensor = np.array(tensor).astype(compare_dtype)
+    if isinstance(gold, np.ndarray):
+        gold = gold.astype(compare_dtype)
+    if isinstance(tensor, np.ndarray):
+        tensor = tensor.astype(compare_dtype)
 
     if gold.shape != tensor.shape:
         print(
