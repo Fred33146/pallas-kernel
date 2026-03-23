@@ -7,7 +7,7 @@ import functools
 from tops.ops.utils import exp
 
 
-def build_chunk_map(cu_seqlens, T_sum, BT):
+def _build_chunk_map(cu_seqlens, T_sum, BT):
     NT = T_sum // BT
     chunk_ids = lax.iota(jnp.int32, NT)
     chunk_pos = chunk_ids * BT
@@ -20,10 +20,11 @@ def _chunk_fwd_h_kernel(
     v_ref,  # [1, T_sum, BV]
     h0_ref,  # [N, 1, BK, BV]
     gk_ref,  # [1, T_sum, BK]
+    g_ref,   # [1, T_sum]
     g_gamma,  # [H]
     cu_seqlens_ref,  # [num_seq+1]
     chunk_to_seq,  # [T_sum/BT]
-    h_ref,  # [NS, 1, BK, BV]
+    h_ref,  # [NS, 1, BK, BV] outputs
     ht_ref,  # [N, 1, BK , BV]
     *,
     BT,
@@ -78,6 +79,12 @@ def _chunk_fwd_h_kernel(
         k = k_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT,BK]
         v = v_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT,BV]
 
+        if g_ref is not None:
+            b_g_scalar = g_ref[0, pl.dslice(t0, BT)]  # [BT]
+            b_g_scalar_last = b_g_scalar[BT - 1]       # scalar
+            b_h *= exp(b_g_scalar_last)                 # uniform decay
+            v = (v * exp(b_g_scalar_last - b_g_scalar)[:, None]).astype(v.dtype)
+
         if g_gamma is not None:
             b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - bos - i_in_seq * BT)
             b_h *= exp(b_g_last)
@@ -130,6 +137,7 @@ def check_chunk_fwd(x):
 def chunk_fwd_h_kernel(
     k: jax.Array,  # [B,T,H,K]
     v: jax.Array,  # [B,T,H,V]
+    *,
     g: jax.Array | None = None,  # [B,T,H]
     g_gamma: jax.Array | None = None,  # (H,)
     gk: jax.Array | None = None,  # [B,T,H,K]
@@ -137,12 +145,11 @@ def chunk_fwd_h_kernel(
     h0: jax.Array | None = None,  # [N,H,K,V]
     output_final_state: bool = False,
     cu_seqlens: jax.Array | None = None,
-    chunk_size: int = 128,
+    chunk_size: int = 64,
     split_size: int | None = None,
     states_in_fp32: bool = False,
     interpret: bool = False,
 ):
-    check_chunk_fwd(g)
     check_chunk_fwd(gv)
     # todo: tune bk and bv for bast performance
     BK = 128
@@ -161,7 +168,7 @@ def chunk_fwd_h_kernel(
     if cu_seqlens is None:
         cu_seqlens = jnp.arange(B * T + 1, step=T)
     T_sum = B * T
-    chunk_to_seq = build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
+    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
 
     N, NS = (
         len(cu_seqlens) - 1,
@@ -176,6 +183,9 @@ def chunk_fwd_h_kernel(
     if gk is not None:
         gk = jnp.reshape(gk, (T_sum, H, K))
         gk = jnp.transpose(gk, (1, 0, 2))  # (H,B*T,K)
+    if g is not None:
+        g = jnp.reshape(g, (T_sum, H))
+        g = jnp.transpose(g, (1, 0))  # (H, T_sum)
 
     grid = (H, pl.cdiv(K, BK), pl.cdiv(V, BV))
 
@@ -222,6 +232,10 @@ def chunk_fwd_h_kernel(
         in_specs.append(pl.BlockSpec((1, T_sum, BK), gk_index_map))
     else:
         in_specs.append(None)
+    if g is not None:
+        in_specs.append(pl.BlockSpec((1, T_sum), lambda head_index, _, __: (head_index, 0)))
+    else:
+        in_specs.append(None)
 
     if g_gamma is not None:
         in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
@@ -254,7 +268,7 @@ def chunk_fwd_h_kernel(
             vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
-    )(k, v, h0, gk, g_gamma, cu_seqlens, chunk_to_seq)
+    )(k, v, h0, gk, g, g_gamma, cu_seqlens, chunk_to_seq)
     if output_final_state:
         return h, ht
     return h, None
@@ -481,8 +495,10 @@ def chunk_bwd_dh_ref(
 def _chunk_bwd_dh_kernel(
     q_ref,          # [1, T_sum, BK]
     do_ref,         # [1, T_sum, BV]
-    dht_ref,        # [N, 1, BK, BV] or None
-    gk_ref,         # [1, T_sum, BK] or None
+    dht_ref,        # [N, 1, BK, BV]
+    gk_ref,         # [1, T_sum, BK]
+    g_ref,          # [1, T_sum]
+    g_gamma,        # [H]
     cu_seqlens_ref, # [num_seq + 1]
     chunk_to_seq,   # [T_sum // BT]
     dh_ref,         # [NS, 1, BK, BV]
@@ -498,6 +514,10 @@ def _chunk_bwd_dh_kernel(
     NTS = BS // BT
 
     b_dh = jnp.zeros((BK, BV), dtype=jnp.float32)
+
+    if g_gamma is not None:
+        head_index = pl.program_id(0)
+        b_g_ramp = g_gamma[head_index] * (jnp.arange(0, BT) + 1)  # [BT]
 
     def body(step, b_dh):
         i_t = NT - 1 - step
@@ -520,23 +540,37 @@ def _chunk_bwd_dh_kernel(
         i_s = i_t // NTS
 
         def store_fn(_):
-            dh_ref[i_s, 0] = b_dh
+            dh_ref[i_s, 0] = b_dh.astype(dh_ref.dtype)
+            return None
 
         lax.cond((i_t % NTS) == 0, store_fn, lambda _: None, operand=None)
 
         b_q = q_ref[(0, pl.dslice(t0, BT), slice(None))]    # [BT, BK]
         b_do = do_ref[(0, pl.dslice(t0, BT), slice(None))]   # [BT, BV]
+        b_q = (b_q * scale).astype(b_q.dtype)
 
+        # scalar gate (g)
+        if g_ref is not None:
+            b_g_scalar = g_ref[0, pl.dslice(t0, BT)]  # [BT]
+            b_g_scalar_last = b_g_scalar[BT - 1]
+            b_dh *= exp(b_g_scalar_last)
+            b_q = (b_q * exp(b_g_scalar)[:, None]).astype(b_q.dtype)
+
+        # per-head fixed decay (g_gamma)
+        if g_gamma is not None:
+            b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - t0)
+            b_dh *= exp(b_g_last)
+            b_q = (b_q * exp(b_g_ramp)[:, None]).astype(b_q.dtype)
+
+        # per-K-dim gate (gk)
         if gk_ref is not None:
             b_gk = gk_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT, BK]
             g_last = b_gk[BT - 1, :]
-            b_dh = b_dh * jnp.exp(g_last)[:, None]  # [BK, BV] * [BK, 1]
-            b_q_hat = (b_q * jnp.exp(b_gk) * scale).astype(b_q.dtype)
-        else:
-            b_q_hat = (b_q * scale).astype(b_q.dtype)
+            b_dh = b_dh * exp(g_last)[:, None]  # [BK, BV] * [BK, 1]
+            b_q = (b_q * exp(b_gk)).astype(b_q.dtype)
 
         b_dh = b_dh + jax.lax.dot(
-            b_q_hat.T, b_do,
+            b_q.astype(jnp.float32).T, b_do,
             precision=lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
@@ -547,7 +581,8 @@ def _chunk_bwd_dh_kernel(
 
         def write_dh0(_):
             if dh0_ref is not None:
-                dh0_ref[seq_idx, 0] = b_dh
+                dh0_ref[seq_idx, 0] = b_dh.astype(dh0_ref.dtype)
+            return None
 
         lax.cond(is_first_chunk, write_dh0, lambda _: None, operand=None)
 
@@ -571,6 +606,8 @@ def chunk_bwd_dh_kernel(
     q: jax.Array,                # [B, T, H, K]
     k: jax.Array,                # [B, T, H, K] (unused but kept for API compatibility)
     v: jax.Array,                # [B, T, H, V] (unused but kept for API compatibility)
+    g: jax.Array | None = None,  # [B, T, H]
+    g_gamma: jax.Array | None = None,  # [H]
     gk: jax.Array | None = None, # [B, T, H, K]
     do: jax.Array = None,        # [B, T, H, V]
     dht: jax.Array | None = None,# [N, H, K, V]
@@ -597,13 +634,15 @@ def chunk_bwd_dh_kernel(
 
     if cu_seqlens is None:
         cu_seqlens = jnp.arange(T_sum + 1, step=T)
-    chunk_to_seq = build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
+    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
     N, NS = len(cu_seqlens) - 1, T_sum // BS
 
     q = jnp.reshape(q, (T_sum, H, K)).transpose(1, 0, 2)   # [H, T_sum, K]
     do = jnp.reshape(do, (T_sum, H, V)).transpose(1, 0, 2)  # [H, T_sum, V]
     if gk is not None:
         gk = jnp.reshape(gk, (T_sum, H, K)).transpose(1, 0, 2)
+    if g is not None:
+        g = jnp.reshape(g, (T_sum, H)).transpose(1, 0)  # (H, T_sum)
 
     grid = (H, pl.cdiv(K, BK), pl.cdiv(V, BV))
 
@@ -629,8 +668,10 @@ def chunk_bwd_dh_kernel(
     in_specs = [
         pl.BlockSpec((1, T_sum, BK), idx_map_K),   # q
         pl.BlockSpec((1, T_sum, BV), idx_map_V),    # do
-        pl.BlockSpec((N, 1, BK, BV), idx_map_state) if dht is not None else None,
-        pl.BlockSpec((1, T_sum, BK), idx_map_K) if gk is not None else None,
+        pl.BlockSpec((N, 1, BK, BV), idx_map_state) if dht is not None else None,  # dht
+        pl.BlockSpec((1, T_sum, BK), idx_map_K) if gk is not None else None,  # gk
+        pl.BlockSpec((1, T_sum), lambda h, _, __: (h, 0)) if g is not None else None,  # g
+        pl.BlockSpec(memory_space=pltpu.SMEM) if g_gamma is not None else None,  # g_gamma
         pl.BlockSpec(memory_space=pltpu.SMEM),      # cu_seqlens
         pl.BlockSpec(memory_space=pltpu.SMEM),      # chunk_to_seq
     ]
@@ -651,6 +692,6 @@ def chunk_bwd_dh_kernel(
             dimension_semantics=("parallel", "parallel", "parallel"),
             vmem_limit_bytes=32 * 1024 * 1024,
         ),
-    )(q, do, dht, gk, cu_seqlens, chunk_to_seq)
+    )(q, do, dht, gk, g, g_gamma, cu_seqlens, chunk_to_seq)
 
     return dh_all, dh0

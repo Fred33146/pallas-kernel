@@ -336,23 +336,33 @@ def chunk_bwd_dqkwg(
     do: jax.Array,      # [B, T, H, V]
     dh: jax.Array,      # [NT_total, H, K, V]
     *,
+    w: jax.Array | None = None,        # [B, T, H, K] (optional, for delta rule)
     g: jax.Array | None = None,        # [B, T, H] chunk-local cumsum of scalar gate
     g_gamma: jax.Array | None = None,  # [H] per-head fixed decay rate
+    dv: jax.Array | None = None,       # [B, T, H, V] (optional, for efficiency/delta rule)
     scale: float | None = None,
-    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens: jax.Array | None = None,
     chunk_size: int = 64,
-) -> tuple[jax.Array, jax.Array, None, jax.Array | None]:
-    """Backward: gradients of q, k, and g (pure JAX reference).
+) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
+    """Backward: gradients of q, k, w and g (pure JAX reference).
 
-    dq = (do @ h^T + causal(ds) @ k) * scale      (no gate)
-    dk = v @ dh^T + causal(ds)^T @ q * scale       (no gate)
+    Matches Triton ``chunk_bwd_kernel_dqkwg`` semantics exactly.
 
-    where ds = do @ v^T, masked by causal (i >= j).
+    For Gated Linear Attention / RetNet:
+      dq = (do @ h^T * exp(g) + causal(ds) @ k) * scale
+      dk = v @ dh^T * exp(-g + g_last) + causal(ds)^T @ q
 
-    Returns (dq, dk, None, dg).  Third element is a placeholder (dw for delta rule).
+    For Delta Rule (when w and dv are provided):
+      dw = -(dv @ h^T)
 
-    Note: when g is provided, the returned dg is the "raw" per-position gradient
-    (NOT reverse-cumsummed). The caller must apply revcumsum if needed.
+    where ds = causal(do @ v^T * exp(g_row - g_col)) * scale.
+
+    Returns (dq, dk, dw, dg).
+
+    Note: when g is provided, the returned dg is the *raw* per-position
+    gradient (with dg_last folded into the last position of each chunk,
+    but NOT reverse-cumsummed).  The caller must apply reverse cumsum
+    to obtain the final gate gradient.
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -364,7 +374,7 @@ def chunk_bwd_dqkwg(
 
     assert scale is not None
     assert T % C == 0
-    assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % C == 0).all()
+    assert (cu_seqlens is None) or (cu_seqlens % C == 0).all()
 
     h = h.reshape(B, NT, H, K, V)
     dh = dh.reshape(B, NT, H, K, V)
@@ -387,6 +397,16 @@ def chunk_bwd_dqkwg(
         precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
     )
 
+    # Delta Rule specific backward to w
+    dw = None
+    if w is not None and dv is not None:
+        dv_c = dv.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)
+        dw_c = jnp.matmul(
+            dv_c, jnp.swapaxes(h, -2, -1),
+            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        )
+        dw = -dw_c.transpose(0, 1, 3, 2, 4).reshape(B, T, H, K).astype(w.dtype)
+
     # Intra-chunk: ds = do @ v^T -> [B, NT, H, C, C]
     ds = jnp.matmul(
         do_c, jnp.swapaxes(v_c, -2, -1),
@@ -400,36 +420,44 @@ def chunk_bwd_dqkwg(
 
     if g is not None:
         g_c = g.reshape(B, NT, C, H).transpose(0, 1, 3, 2)  # [B, NT, H, C]
-        g_last = g_c[..., -1:]  # [B, NT, H, 1]
+        g_last_per_chunk = g_c[..., -1:]  # [B, NT, H, 1]
 
-        # dg_last = sum(h * dh) * exp(g_last) over K,V dims
-        dg_last = jnp.sum(h * dh, axis=(-2, -1))  # [B, NT, H]
-        dg_last = dg_last * exp(g_last[..., 0])    # [B, NT, H]
+        # Triton V-loop: b_dg_last += sum(b_h * b_dh) across all V,K blocks
+        # Then after the loop: b_dg_last *= exp(b_g_last)
+        dg_last_term = jnp.sum(h * dh, axis=(-2, -1))  # [B, NT, H]
+        dg_last_term = dg_last_term * exp(g_last_per_chunk[..., 0])  # [B, NT, H]
 
-        # dq_inter with gate
-        dq_inter = dq_inter * exp(g_c)[..., None] * scale
-        # dg from dq: sum(dq_inter * q, axis=-1)
-        dg_dq = jnp.sum(dq_inter * q_c, axis=-1)  # [B, NT, H, C]
+        # 1. dq with gate
+        # b_dq = b_dq * exp(b_g)[:, None] * scale
+        dq_gate = dq_inter * exp(g_c)[..., None] * scale
+        # b_dg += tl.sum(b_dq * b_q, axis=1)
+        dg_from_dq = jnp.sum(dq_gate * q_c, axis=-1)  # [B, NT, H, C]
 
-        # dk_inter with gate
-        dk_inter = dk_inter * exp(-g_c + g_last)[..., None]
-        # dg from dk: -sum(k * dk_inter, axis=-1)
-        dg_dk = -jnp.sum(k_c * dk_inter, axis=-1)  # [B, NT, H, C]
-        # dg_last += sum(dk_inter * k) over positions and K
-        dg_last = dg_last + jnp.sum(dk_inter * k_c, axis=(-2, -1))  # [B, NT, H]
+        # 2. dk with gate
+        # b_dk = b_dk * tl.where(m_t, exp(-b_g + b_g_last), 0)[:, None]
+        dk_gate = dk_inter * exp(-g_c + g_last_per_chunk)[..., None]
+        # b_dg -= tl.sum(b_k * b_dk, axis=1)
+        dg_from_dk = -jnp.sum(k_c * dk_gate, axis=-1)   # [B, NT, H, C]
+        # b_dg_last += tl.sum(b_dk * b_k)
+        dg_last_term = dg_last_term + jnp.sum(dk_gate * k_c, axis=(-2, -1))  # [B, NT, H]
 
-        # ds with gate
-        ds = jnp.where(causal_mask, ds * exp(g_c[..., :, None] - g_c[..., None, :]), 0.0) * scale
-        # ds2 = ds * (q @ k^T)
+        # 3. ds with gate and causal mask
+        # b_ds = tl.where(m_A, b_ds * exp(b_g[:, None] - b_g[None, :]), 0) * scale
+        ds_gate = jnp.where(causal_mask, ds * exp(g_c[..., :, None] - g_c[..., None, :]), 0.0) * scale
+
+        # b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
         qk = jnp.matmul(
             q_c, jnp.swapaxes(k_c, -2, -1),
             precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
         )
-        ds2 = ds * qk
-        dg_ds = jnp.sum(ds2, axis=-1) - jnp.sum(ds2, axis=-2)  # [B, NT, H, C]
+        ds2 = ds_gate * qk
+
+        # b_dg += tl.sum(b_ds2, axis=1)  — row-sum (reduce over key dim j)
+        # b_dg -= tl.sum(b_ds2, axis=0)  — col-sum (reduce over query dim i)
+        dg_from_ds = jnp.sum(ds2, axis=-1) - jnp.sum(ds2, axis=-2)  # [B, NT, H, C]
 
         # Intra-chunk: dq += ds @ k, dk += ds^T @ q
-        ds_cast = ds.astype(k_c.dtype)
+        ds_cast = ds_gate.astype(k_c.dtype)
         dq_intra = jnp.matmul(
             ds_cast, k_c,
             precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
@@ -439,12 +467,15 @@ def chunk_bwd_dqkwg(
             precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
         )
 
-        dq = dq_inter + dq_intra
-        dk = dk_inter + dk_intra
+        dq = dq_gate + dq_intra
+        dk = dk_gate + dk_intra
 
-        # Combine dg: add dg_last to the last position
-        dg_c = dg_dq + dg_dk + dg_ds  # [B, NT, H, C]
-        dg_c = dg_c.at[..., -1].add(dg_last)
+        # Assemble per-position dg, fold dg_last into the last position of each chunk.
+        # Triton: b_dg = tl.where(o_t < last, b_dg, b_dg + b_dg_last)
+        # NOTE: reverse cumsum is NOT applied here — matches Triton kernel output.
+        #       The caller must apply reverse cumsum to obtain the final gate gradient.
+        dg_c = dg_from_dq + dg_from_dk + dg_from_ds   # [B, NT, H, C]
+        dg_c = dg_c.at[..., -1].add(dg_last_term)
 
         # [B, NT, H, C] -> [B, NT, C, H] -> [B, T, H]
         dg = dg_c.transpose(0, 1, 3, 2).reshape(B, T, H)
@@ -489,6 +520,7 @@ def chunk_bwd_dqkwg(
             ds_cast, k_c,
             precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
         )
+        # Note: Triton applies scale to dk_intra * scale
         dk_intra = jnp.matmul(
             jnp.swapaxes(ds_cast, -2, -1), q_c,
             precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
@@ -501,4 +533,4 @@ def chunk_bwd_dqkwg(
     dq = dq.transpose(0, 1, 3, 2, 4).reshape(B, T, H, K)
     dk = dk.transpose(0, 1, 3, 2, 4).reshape(B, T, H, K)
 
-    return dq.astype(q.dtype), dk.astype(k.dtype), None, dg
+    return dq.astype(q.dtype), dk.astype(k.dtype), dw, dg
