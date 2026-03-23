@@ -15,7 +15,6 @@ def next_power_of_2(n: int):
     n += 1
     return n
 
-
 @singledispatch
 def cdiv(x: int, y: int):
     return (x + y - 1) // y
@@ -88,3 +87,37 @@ def prepare_chunk_indices(
     block_ids = jnp.arange(total_nt, dtype=jnp.int32) - seq_offsets
 
     return jnp.stack([seq_ids, block_ids], axis=1)
+
+def assert_shape_or_none(x: jax.Array | list[jax.Array | None] | tuple[jax.Array | None, ...] | None,
+                         expected_shape: tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
+    """
+    Concise helper to assert tensor shapes.
+    Skips assertion for any element that is None.
+    Supports a single array or an iterable of arrays that should all match the expected shape.
+    """
+    if x is None:
+        return
+
+    if isinstance(x, (list, tuple)):
+        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+        for i, tensor in enumerate(x):
+            if tensor is not None:
+                curr_name = name[i] if has_names else f"{name}_{i}"
+                assert tensor.shape == expected_shape, f"[{curr_name}] Expected shape {expected_shape}, got {tensor.shape}"
+    else:
+        assert x.shape == expected_shape, f"[{name}] Expected shape {expected_shape}, got {x.shape}"
+
+def assert_shape(x: jax.Array | list[jax.Array] | tuple[jax.Array, ...],
+                 expected_shape: tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
+    """
+    Concise helper to assert tensor shapes.
+    Supports a single array or an iterable of arrays that should all match the expected shape.
+    """
+    if isinstance(x, (list, tuple)):
+        # If name is not a sequence or has mismatched length, use a generic numbered name
+        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+        for i, tensor in enumerate(x):
+            curr_name = name[i] if has_names else f"{name}_{i}"
+            assert tensor.shape == expected_shape, f"[{curr_name}] Expected shape {expected_shape}, got {tensor.shape}"
+    else:
+        assert x.shape == expected_shape, f"[{name}] Expected shape {expected_shape}, got {x.shape}"

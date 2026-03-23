@@ -62,4 +62,8 @@ torchvision = [{ index = "pytorch-cu126", extra = "gpu" }]
 
 
 [tool.ruff]
+indent-width = 2
 ignore = ["E712","E741","F841"]
+
+[tool.ruff.format]
+indent-style = "space"

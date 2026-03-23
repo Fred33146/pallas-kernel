@@ -17,24 +17,24 @@ from tests.utils import compare_tensor
 
 
 CASES = [
-    dict(B=2, T=64, H=4, K=32, V=64, seed=42),
-    dict(B=1, T=128, H=2, K=64, V=128, seed=7),
-    dict(B=2, T=64, H=4, K=32, V=64, seed=13, h0=True),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=42),
+    dict(B=1, T=128, H=2, K=128, V=128, seed=7),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=13, h0=True),
     # dict(B=2, T=64, H=4, K=32, V=64, seed=14, dht=True),
     # dict(B=2, T=64, H=4, K=32, V=64, seed=15, h0=True, dht=True),
-    dict(B=2, T=64, H=1, K=32, V=64, seed=10),
-    dict(B=2, T=64, H=4, K=16, V=128, seed=20),
-    dict(B=2, T=64, H=4, K=128, V=16, seed=21),
+    dict(B=2, T=64, H=1, K=128, V=128, seed=10),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=20),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=21),
     # odd T (needs padding)
-    dict(B=2, T=100, H=4, K=32, V=64, seed=400),
-    dict(B=1, T=50, H=2, K=32, V=64, seed=41),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=400),
+    dict(B=1, T=64, H=2, K=128, V=128, seed=41),
     # larger
-    dict(B=1, T=256, H=2, K=32, V=64, seed=300),
-    # dict(B=1, T=256, H=2, K=32, V=64, seed=303, h0=True, dht=True),
-    dict(B=4, T=64, H=8, K=32, V=64, seed=99),
+    dict(B=1, T=256, H=2, K=128, V=128, seed=300),
+    # dict(B=1, T=256, H=2, K=128, V=64, seed=303, h0=True, dht=True),
+    dict(B=4, T=64, H=8, K=128, V=128, seed=99),
     # non-default chunk_size
-    dict(B=2, T=128, H=4, K=32, V=64, seed=502, chunk_size=32),
-    dict(B=2, T=128, H=4, K=32, V=64, seed=503, chunk_size=64),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=502, chunk_size=32),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=503, chunk_size=64),
 ]
 
 

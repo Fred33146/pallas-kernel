@@ -8,16 +8,15 @@ from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 # pallas-kernel/tops/ops/simple_gla/chunk.py
 import functools
 
-import jax
 import jax.experimental.pallas as pl
 import jax.lax as lax
-import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 from tops.utils import pad_to_multiple
 from tops.ops.common.chunk_h import chunk_fwd_h_kernel, chunk_fwd_h_ref
 from tops.ops.common.chunk_o import chunk_fwd_o
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
 from tops.ops.utils import is_tpu_runtime
+from tops.utils import assert_shape, assert_shape_or_none
 
 
 # =============================================================================
@@ -407,7 +406,7 @@ def chunk_simple_gla_pallas_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g_gamma: jax.Array,
+    g_gamma: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None = None,
     output_final_state: bool = False,
@@ -421,7 +420,7 @@ def chunk_simple_gla_pallas_fwd(
         q: [B, T, H, K]
         k: [B, T, H, K]
         v: [B, T, H, V]
-        g_gamma: (1, 1, H, 1) or (H,) — constant scalar gate per head
+        g_gamma: (H,) — constant scalar gate per head
         scale: scaling factor
         initial_state: [B, H, K, V] or None
         output_final_state: whether to return final state
@@ -433,26 +432,20 @@ def chunk_simple_gla_pallas_fwd(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+    assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert T % C == 0, f"T={T} must be divisible by chunk_size={C}"
+    assert (K % 128 == 0) and (V % 128 == 0), f"K={K}, V={V} must be multiples of 128"
+    assert_shape_or_none(g_gamma, (H,))
 
-    # --- T padding ---
-    if T % C != 0:
-        q, k, v = (pad_to_multiple(x, C, axis=1, val=0) for x in (q, k, v))
-
-    # --- K/V padding (chunk_fwd_h_kernel requires K%128==0, V%128==0) ---
-    q, k = (pad_to_multiple(x, 128, axis=3, val=0) for x in (q, k))
-    v = pad_to_multiple(v, 128, axis=3, val=0)
-    if initial_state is not None:
-        initial_state = pad_to_multiple(initial_state, [128, 128], axis=[2, 3], val=0)
-
-    g_gamma_1d = g_gamma.reshape(-1)
-    assert g_gamma_1d.shape[0] == H
-
+    g_gamma_4d = g_gamma.reshape(1, 1, H, 1) if g_gamma is not None else None
     # Stage 1: Inter-chunk state propagation (reuse existing Pallas kernel)
     h, ht = chunk_fwd_h_kernel(
         k=k,
         v=v,
         g=None,
-        g_gamma=g_gamma_1d,
+        g_gamma=g_gamma,
         gk=None,
         h0=initial_state,
         output_final_state=output_final_state,
@@ -462,16 +455,10 @@ def chunk_simple_gla_pallas_fwd(
     h = h.reshape(k.shape[0], -1, k.shape[2], k.shape[3], v.shape[-1])
 
     # Stage 2: Intra-chunk attention (Simple GLA Pallas kernel)
-    A = chunk_simple_gla_fwd_intra(q, k, g_gamma, scale, chunk_size=C)
+    A = chunk_simple_gla_fwd_intra(q, k, g_gamma_4d, scale, chunk_size=C)
 
     # Stage 3: Output combination (Simple GLA Pallas kernel)
-    o = chunk_simple_gla_fwd_o(q, v, A, h, g_gamma, scale, chunk_size=C)
-
-    # --- unpadding ---
-    o = o[..., :V]
-    if ht is not None:
-        ht = ht[..., :K, :V]
-    o = o[:, :T]
+    o = chunk_simple_gla_fwd_o(q, v, A, h, g_gamma_4d, scale, chunk_size=C)
 
     return ht, o
 
@@ -579,27 +566,12 @@ def chunk_simple_gla_bwd(
     V = v.shape[-1]
     C = chunk_size
 
-    # --- T padding ---
-    orig_T = T
-    NT = (T + C - 1) // C
-    T_padded = NT * C
-    if T_padded > T:
-        pad = T_padded - T
-        pad_width = ((0, 0), (0, pad), (0, 0), (0, 0))
-        q = jnp.pad(q, pad_width)
-        k = jnp.pad(k, pad_width)
-        v = jnp.pad(v, pad_width)
-        do = jnp.pad(do, pad_width)
-        T = T_padded
-
-    # --- K/V padding to multiple of 128 ---
-    orig_K, orig_V = K, V
-    q, k = (pad_to_multiple(x, 128, axis=3, val=0) for x in (q, k))
-    v = pad_to_multiple(v, 128, axis=3, val=0)
-    do = pad_to_multiple(do, 128, axis=3, val=0)
-    K, V = q.shape[-1], v.shape[-1]
-    if initial_state is not None:
-        initial_state = pad_to_multiple(initial_state, [128, 128], axis=[2, 3], val=0)
+    assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape(do, (B, T, H, V))
+    assert K % 128 == 0 and V % 128 == 0
+    assert T % C == 0
 
     NT = T // C
 
@@ -640,12 +612,5 @@ def chunk_simple_gla_bwd(
         q, k, v, g_gamma, h, A, do, dh,
         scale=scale, chunk_size=C,
     )
-
-    # --- Unpad ---
-    dq = dq[:, :orig_T, :, :orig_K]
-    dk = dk[:, :orig_T, :, :orig_K]
-    dv = dv[:, :orig_T, :, :orig_V]
-    if dh0 is not None:
-        dh0 = dh0[:, :, :orig_K, :orig_V]
 
     return dq, dk, dv, dh0
