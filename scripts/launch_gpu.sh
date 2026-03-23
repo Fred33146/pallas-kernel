@@ -74,9 +74,9 @@ echo ""
 sky launch "$TEMP_YAML" \
     --cluster="$CLUSTER_NAME" \
     --infra=gcp \
-    -i 30 \
-    # --down \
+    -i 120 \
     -y
+    # --down \
 
 # Store the exit code
 EXIT_CODE=$?

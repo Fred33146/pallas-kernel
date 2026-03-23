@@ -138,7 +138,6 @@ from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd_intra, chunk_simple_g
 from tops.ops.simple_gla.chunk import (
     chunk_simple_gla_pallas_fwd,
     chunk_simple_gla_bwd,
-    chunk_simple_gla,
 )
 from tops.ops.gla.chunk import chunk_gla_bwd
 

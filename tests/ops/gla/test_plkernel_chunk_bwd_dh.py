@@ -114,6 +114,7 @@ def _run_pallas(
         do=do,
         dht=dht,
         scale=scale,
+        output_dh0=True,
         chunk_size=chunk_size,
         cu_seqlens=cu,
     )

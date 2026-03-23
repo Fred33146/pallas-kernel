@@ -1048,6 +1048,7 @@ def chunk_gla_bwd_with_pl(
         do=do,
         dht=dht,
         scale=scale,
+        output_dh0=(initial_state is not None or dht is not None),
         cu_seqlens=cu_seqlens,
         chunk_size=C,
     )
