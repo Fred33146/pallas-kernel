@@ -19,19 +19,8 @@ from tests.utils import compare_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HAS_CUDA = torch.cuda.is_available()
-
-triton_imports_available = False
-try:
-    from fla.ops.simple_gla import fused_recurrent_simple_gla as triton_fused_recurrent
-
-    triton_imports_available = True
-except ImportError:
-    pass
-
-requires_triton = pytest.mark.skipif(
-    not (HAS_CUDA and triton_imports_available),
-    reason="Triton / CUDA not available",
-)
+from fla.ops.simple_gla import fused_recurrent_simple_gla as triton_fused_recurrent
+assert DEVICE == "cuda", "CUDA is required to run these tests."
 
 # ============================================================================
 # Test configs
@@ -154,30 +143,16 @@ def _run_triton(q, k, v, *, g=None, g_gamma=None, h0=None, scale=None):
 def _run_naive(q, k, v, *, g=None, g_gamma=None, h0=None, scale=None):
     """Run JAX naive simple_gla.
 
-    Note: FLA Triton uses g of shape [B, T, H] (scalar per head),
-    while our naive uses g of shape [B, T, H, K] (per element).
-    We broadcast g to [B, T, H, K] for the naive implementation.
-    Similarly, FLA uses g_gamma of shape [H], while naive uses [H, K].
+    Both FLA Triton and naive accept g [B, T, H] and g_gamma [H].
+    The naive implementation broadcasts internally.
     """
     q_jax = _torch_to_jax(q)
     k_jax = _torch_to_jax(k)
     v_jax = _torch_to_jax(v)
-    K = q.shape[-1]
 
-    g_jax = None
-    if g is not None:
-        # Broadcast [B, T, H] -> [B, T, H, K]
-        g_expanded = g.unsqueeze(-1).expand(*g.shape, K)
-        g_jax = _torch_to_jax(g_expanded)
-
-    g_gamma_jax = None
-    if g_gamma is not None:
-        # g_gamma is [H] for both Triton and naive
-        g_gamma_jax = _torch_to_jax(g_gamma)
-
-    h0_jax = None
-    if h0 is not None:
-        h0_jax = _torch_to_jax(h0)
+    g_jax = _torch_to_jax(g) if g is not None else None           # [B, T, H]
+    g_gamma_jax = _torch_to_jax(g_gamma) if g_gamma is not None else None  # [H]
+    h0_jax = _torch_to_jax(h0) if h0 is not None else None
 
     o, s = simple_gla_naive(
         q_jax, k_jax, v_jax,
@@ -195,7 +170,6 @@ def _run_naive(q, k, v, *, g=None, g_gamma=None, h0=None, scale=None):
 # ============================================================================
 
 
-@requires_triton
 @pytest.mark.parametrize("cfg", CASES, ids=[_case_id(c) for c in CASES])
 def test_triton_vs_naive_fwd(cfg):
     B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]

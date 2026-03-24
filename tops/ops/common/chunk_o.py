@@ -104,6 +104,8 @@ def chunk_simple_gla_bwd_o_pl(
     dh: jax.Array,  # [B, NT, H, K, V]
     scale: float,
     chunk_size: int,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     interpret: bool = False,
 ):
     """Launcher for the fused simple GLA backward kernel.

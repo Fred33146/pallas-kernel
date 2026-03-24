@@ -43,6 +43,12 @@ def simple_gla_naive(
     B = q.shape[0]
     T = q.shape[1]
 
+    # Broadcast g [B, T, H] -> [B, T, H, K] and g_gamma [H] -> [B, T, H, K]
+    if g is not None:
+        g = jnp.broadcast_to(g[..., None], (B, T, H, K))
+    if g_gamma is not None:
+        g_gamma = jnp.broadcast_to(g_gamma[None, None, :, None], (B, T, H, K))
+
     if g is None:
         if g_gamma is not None:
             g = g_gamma

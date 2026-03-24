@@ -302,7 +302,7 @@ def chunk_gla_fwd_intra_gk_ref(
     k: jax.Array,
     g: jax.Array,
     scale: float,
-    cu_seqlens: np.ndarray | None = None,
+    cu_seqlens_dev: np.ndarray | None = None,
     chunk_size: int = 64,
 ) -> jax.Array:
     """Intra-chunk attention matrix with causal mask.

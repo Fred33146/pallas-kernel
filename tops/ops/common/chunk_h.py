@@ -651,7 +651,7 @@ def chunk_bwd_dh_kernel(
     dht: jax.Array | None = None,# [N, H, K, V]
     scale: float = 1.0,
     output_dh0: bool = False,
-    cu_seqlens: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 128,
     split_size: int | None = None,
     states_in_fp32: bool = False,
@@ -670,10 +670,10 @@ def chunk_bwd_dh_kernel(
         f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     )
 
-    if cu_seqlens is None:
-        cu_seqlens = jnp.arange(T_sum + 1, step=T)
-    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
-    N, NS = len(cu_seqlens) - 1, T_sum // BS
+    if cu_seqlens_dev is None:
+        cu_seqlens_dev = jnp.arange(T_sum + 1, step=T)
+    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens_dev, T_sum=T_sum, BT=BT)
+    N, NS = len(cu_seqlens_dev) - 1, T_sum // BS
 
     q = jnp.reshape(q, (T_sum, H, K)).transpose(1, 0, 2)   # [H, T_sum, K]
     do = jnp.reshape(do, (T_sum, H, V)).transpose(1, 0, 2)  # [H, T_sum, V]
@@ -730,7 +730,7 @@ def chunk_bwd_dh_kernel(
             dimension_semantics=("parallel", "parallel", "parallel"),
             vmem_limit_bytes=32 * 1024 * 1024,
         ),
-    )(q, do, dht, gk, g, g_gamma, cu_seqlens, chunk_to_seq)
+    )(q, do, dht, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
 
     dh_all = dh_all.reshape(B, -1, H, K, V)
     dh0 = dh0.reshape(N, H, K, V) if dh0 is not None else None

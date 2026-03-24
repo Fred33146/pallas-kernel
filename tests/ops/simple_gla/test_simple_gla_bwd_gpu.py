@@ -19,19 +19,8 @@ from tests.utils import compare_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HAS_CUDA = torch.cuda.is_available()
-
-triton_imports_available = False
-try:
-    from fla.ops.simple_gla import fused_recurrent_simple_gla as triton_fused_recurrent
-
-    triton_imports_available = True
-except ImportError:
-    pass
-
-requires_triton = pytest.mark.skipif(
-    not (HAS_CUDA and triton_imports_available),
-    reason="Triton / CUDA not available",
-)
+assert DEVICE == "cuda", "CUDA is required to run these tests."
+from fla.ops.simple_gla import fused_recurrent_simple_gla as triton_fused_recurrent
 
 # ============================================================================
 # Test configs (keep T small — naive backward unrolls Python for-loops)
@@ -135,20 +124,9 @@ def _run_naive_bwd(q, k, v, do, *, g=None, g_gamma=None, h0=None, scale=None):
     k_jax = _torch_to_jax(k)
     v_jax = _torch_to_jax(v)
     do_jax = _torch_to_jax(do)
-    B, T, H, K = q.shape
 
-    g_jax = None
-    if g is not None:
-        g_expanded = g.unsqueeze(-1).expand(B, T, H, K)
-        g_jax = _torch_to_jax(g_expanded)
-
-    g_gamma_jax = None
-    if g_gamma is not None:
-        g_gamma_1d = _torch_to_jax(g_gamma)  # [H]
-        g_gamma_jax = jnp.broadcast_to(
-            g_gamma_1d.reshape(1, 1, H, 1), (B, T, H, K)
-        )
-
+    g_jax = _torch_to_jax(g) if g is not None else None           # [B, T, H]
+    g_gamma_jax = _torch_to_jax(g_gamma) if g_gamma is not None else None  # [H]
     h0_jax = _torch_to_jax(h0) if h0 is not None else None
 
     def fwd_fn(q, k, v):
@@ -170,7 +148,6 @@ def _run_naive_bwd(q, k, v, do, *, g=None, g_gamma=None, h0=None, scale=None):
 # ============================================================================
 
 
-@requires_triton
 @pytest.mark.parametrize("cfg", BWD_CASES, ids=[_case_id(c) for c in BWD_CASES])
 def test_triton_vs_naive_bwd(cfg):
     B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]
