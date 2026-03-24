@@ -54,6 +54,10 @@ The current package-level dependency tree (ordered bottom-up):
 *   **`tests/ops/`**: Modifications to low-level operators (e.g., scheduling optimizations of Pallas kernels) must use the two comparison test categories above to verify results or gradient tolerances. It is strictly prohibited to overstep and rely on high-level tests (such as `test_gla.py` in the layers tier) as a workaround for validation.
 *   **`tests/modules/` & `tests/layers/`**: Modifications at the network component or layer levels must include corresponding integration encapsulation and data flow validation tests.
 
+*   **`tops/cpu/` is the default Gold/Reference**: Implementations under `tops/cpu/` are treated as canonical reference implementations. Any new Pallas/JAX implementation added under `tops/ops/` must, by default, align against `tops/cpu/` through reference-comparison tests.
+*   **How reference correctness is established**: The correctness of `tops/cpu/` must be continuously validated against `torch_gpu/torch_cpu` comparisons, so it remains a trustworthy baseline.
+*   **Default comparator and GPU-specific exception**: The default comparator is `tops/cpu/`. If GPU-based comparison is required (e.g., Torch/Triton), create a separate test file and append the `_gpu` suffix to its filename.
+
 ---
 
 If a new feature needs to be added within an existing layer, find the level that best matches its granularity and adhere to that level's restrictions (and be sure to add corresponding tests). For new components whose classification is ambiguous, start by initiating a technical design brainstorm via `docs/design-docs/`.
