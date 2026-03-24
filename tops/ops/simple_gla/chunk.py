@@ -6,7 +6,7 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
 from tops.ops.common.chunk_h import chunk_fwd_h_ref as chunk_fwd_h
-from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
+from tops.ops.common.chunk_h import chunk_bwd_dh_ref as chunk_bwd_dh
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
@@ -501,7 +501,6 @@ def chunk_simple_gla_fwd(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
-        interpret=not is_tpu_runtime(),
     )
     o = chunk_fwd_o(
         q=q,
@@ -602,15 +601,17 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
+
+    # Build synthetic gk from g_gamma for kernels that need it
+    gk = _build_gk_from_gamma(g_gamma, B, T, H, K, C) if g_gamma is not None else None
 
     # 2. Compute dh via chunk_bwd_dh_kernel
     dh, dh0 = chunk_bwd_dh(
         q, k, v,
-        g=g,
-        g_gamma=g_gamma,
-        gk=None,
+        g=None,
+        g_gamma=None,
+        gk=gk,
         do=do,
         dht=dht,
         scale=scale,
@@ -618,11 +619,8 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
 
-    # Build synthetic gk from g_gamma for kernels that need it
-    gk = _build_gk_from_gamma(g_gamma, B, T, H, K, C) if g_gamma is not None else None
     # 3. Compute A via existing intra-chunk attention with synthetic gk
     A = chunk_gla_fwd_intra_gk_ref(q, k, gk, scale, chunk_size=C,cu_seqlens_dev=cu_seqlens_dev)
 

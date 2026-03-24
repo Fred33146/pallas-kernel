@@ -435,12 +435,17 @@ def chunk_bwd_dh_ref(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
+    g: jax.Array,
+    g_gamma: jax.Array,
     gk: jax.Array,
     do: jax.Array,
     h0: jax.Array | None = None,
     dht: jax.Array | None = None,
     scale: float = 1.0,
+    output_dh0: bool = False,
+    states_in_fp32: bool = False,
     cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Backward hidden state gradient propagation.
