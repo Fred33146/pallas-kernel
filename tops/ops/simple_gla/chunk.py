@@ -5,9 +5,8 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
+from tops.ops.common.chunk_h import chunk_fwd_h_ref as chunk_fwd_h
 from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
-from tops.ops.common.chunk_h import chunk_fwd_h_ref
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
@@ -446,7 +445,6 @@ def _chunk_simple_gla_pallas_fwd(
         h0=initial_state,
         output_final_state=output_final_state,
         chunk_size=C,
-        interpret=not is_tpu_runtime(),
     )
 
     # Stage 2: Intra-chunk attention (Simple GLA Pallas kernel)

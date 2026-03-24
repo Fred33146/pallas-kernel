@@ -322,8 +322,8 @@ def chunk_fwd_h_ref(
     h0: jax.Array | None = None,
     output_final_state: bool = False,
     states_in_fp32: bool = False,
-    cu_seqlens: jax.Array | None = None,
     cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Inter-chunk hidden state propagation.
@@ -341,7 +341,7 @@ def chunk_fwd_h_ref(
         h0: [N, H, K, V] — initial hidden state (optional)
         output_final_state: whether to return final state
         states_in_fp32: if True, store h_all in float32 instead of k.dtype
-        cu_seqlens: cumulative sequence lengths (optional)
+        cu_seqlens_dev: cumulative sequence lengths (optional)
         cu_seqlens_cpu: alias for cu_seqlens (backward compat)
         chunk_size: block size
 
@@ -349,17 +349,14 @@ def chunk_fwd_h_ref(
         h:  [B, NT, H, K, V] — hidden state at the start of each chunk
         ht: [B, H, K, V] or None — final hidden state
     """
-    # Accept both cu_seqlens and cu_seqlens_cpu for backward compat
-    if cu_seqlens is None and cu_seqlens_cpu is not None:
-        cu_seqlens = cu_seqlens_cpu
 
     B, T, H, K = k.shape
     V = v.shape[-1]
     C = chunk_size
     NT = T // C
-    N = B if cu_seqlens is None else cu_seqlens.shape[-1] - 1
+    N = B if cu_seqlens_dev is None else cu_seqlens_dev.shape[-1] - 1
     assert T % C == 0, "T must be a multiple of chunk_size for chunk_fwd_h"
-    assert (cu_seqlens is None) or (cu_seqlens % C == 0).all(), (
+    assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % C == 0).all(), (
         "cu_seqlens must be multiples of chunk_size for chunk_fwd_h"
     )
 
@@ -373,12 +370,12 @@ def chunk_fwd_h_ref(
     ht = jnp.zeros([N, H, K, V], dtype=jnp.float32)
     h_all = jnp.zeros([B, NT, H, K, V], dtype=h_dtype)
     for i_n in range(N):
-        if cu_seqlens is None:
+        if cu_seqlens_cpu is None:
             bos = i_n * T
             eos = (i_n + 1) * T
         else:
-            bos = int(cu_seqlens[i_n])
-            eos = int(cu_seqlens[i_n + 1])
+            bos = int(cu_seqlens_cpu[i_n])
+            eos = int(cu_seqlens_cpu[i_n + 1])
 
         h = jnp.zeros((H, K, V), dtype=jnp.float32)
         if h0 is not None:
@@ -390,7 +387,7 @@ def chunk_fwd_h_ref(
 
         NT_seq = (eos - bos) // C
         for i_t in range(NT_seq):
-            if cu_seqlens is None:
+            if cu_seqlens_cpu is None:
                 h_all = h_all.at[i_n, i_t].set(h.astype(h_all.dtype))
             else:
                 h_all = h_all.at[0, bos // C + i_t].set(h.astype(h_all.dtype))
