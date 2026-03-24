@@ -420,7 +420,7 @@ def chunk_gla_fwd_intra_gk(
         in_specs=[spec, spec, spec],
         out_specs=A_spec,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
     )(_q, _k, _g)
@@ -1369,7 +1369,7 @@ def chunk_gla_fwd_o_gk_pl(
         in_specs=[q_spec, v_spec, g_spec, h_spec, A_spec],
         out_specs=o_spec,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
     )(_q, _v, _g, _h, _A)
@@ -1530,7 +1530,7 @@ def chunk_gla_bwd_fused_pl(
         in_specs=[spec_K, spec_K, spec_V, spec_K, spec_h, spec_A, spec_V, spec_h],
         out_specs=[spec_K, spec_K, spec_V, spec_K],
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024, # 32 MB limit to be safe
+            # vmem_limit_bytes=32 * 1024 * 1024, # 32 MB limit to be safe
             disable_bounds_checks=True,
         ),
     )(_q, _k, _v, _g, _h, _A, _do, _dh)

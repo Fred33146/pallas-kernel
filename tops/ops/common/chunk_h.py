@@ -300,7 +300,7 @@ def chunk_fwd_h_kernel(
                 "arbitrary",
                 "arbitrary",
             ),
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
     )(k, v, h0, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
@@ -728,7 +728,7 @@ def chunk_bwd_dh_kernel(
         interpret=interpret,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "parallel"),
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
         ),
     )(q, do, dht, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
 

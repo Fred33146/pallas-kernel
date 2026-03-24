@@ -254,7 +254,7 @@ def _chunk_simple_gla_fwd_intra(
         in_specs=[spec, spec, g_gamma_spec],
         out_specs=A_spec,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
         interpret=interpret,
@@ -379,7 +379,7 @@ def _chunk_simple_gla_fwd_o(
         in_specs=[q_spec, v_spec, h_spec, A_spec, g_gamma_spec],
         out_specs=o_spec,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
         interpret=interpret,

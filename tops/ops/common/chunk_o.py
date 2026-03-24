@@ -150,7 +150,7 @@ def chunk_simple_gla_bwd_o_pl(
         in_specs=[spec_K, spec_K, spec_V, spec_gamma, spec_h, spec_A, spec_V, spec_h],
         out_specs=[spec_K, spec_K, spec_V],
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=32 * 1024 * 1024,
+            # vmem_limit_bytes=32 * 1024 * 1024,
         ),
         interpret=interpret,
     )(_q, _k, _v, g_gamma, _h, _A, _do, _dh)
