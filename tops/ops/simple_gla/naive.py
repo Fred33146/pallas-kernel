@@ -31,8 +31,8 @@ def simple_gla_naive(
     )
     N = len(cu_seqlens_cpu) - 1 if cu_seqlens_cpu is not None else _B
 
-    assert (g is None) or (g.ndim == 4)
-    assert (g_gamma is None) or (g_gamma.ndim == 4)
+    assert (g is None) or (g.ndim == 3)
+    assert (g_gamma is None) or (g_gamma.ndim == 1)
 
     if cu_seqlens_cpu is not None:
         q = q.reshape(1, -1, H, K)

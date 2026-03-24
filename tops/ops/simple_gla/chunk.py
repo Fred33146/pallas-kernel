@@ -1,22 +1,18 @@
-import jax
-import jax.numpy as jnp
-
-from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
-from tops.ops.common.chunk_h import chunk_fwd_h_ref
-from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
-from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
-# pallas-kernel/tops/ops/simple_gla/chunk.py
 import functools
 
+import jax
+import jax.numpy as jnp
 import jax.experimental.pallas as pl
-import jax.lax as lax
-from jax.experimental.pallas import tpu as pltpu
-from tops.utils import pad_to_multiple
-from tops.ops.common.chunk_h import chunk_fwd_h_kernel, chunk_fwd_h_ref
-from tops.ops.common.chunk_o import chunk_fwd_o
+import jax.experimental.pallas.tpu as pltpu
+
+from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
+from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
+from tops.ops.common.chunk_h import chunk_fwd_h_ref
+from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
+
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
 from tops.ops.utils import is_tpu_runtime
-from tops.utils import assert_shape, assert_shape_or_none
+from tops.utils import assert_shape, assert_shape_or_none, export_public, pad_to_multiple
 
 
 # =============================================================================
@@ -24,7 +20,7 @@ from tops.utils import assert_shape, assert_shape_or_none
 # =============================================================================
 
 
-def chunk_simple_gla_fwd_intra_ref(
+def _chunk_simple_gla_fwd_intra_ref(
     q: jax.Array,
     k: jax.Array,
     g_gamma: jax.Array,
@@ -55,7 +51,7 @@ def chunk_simple_gla_fwd_intra_ref(
     # Standard attention (no per-element gating)
     A = jnp.einsum(
         "bnihk,bnjhk->bnihj", q_c, k_c,
-        precision=lax.Precision.HIGHEST,
+        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     ) * scale
 
@@ -70,7 +66,7 @@ def chunk_simple_gla_fwd_intra_ref(
     return A
 
 
-def chunk_simple_gla_fwd_o_ref(
+def _chunk_simple_gla_fwd_o_ref(
     q: jax.Array,
     v: jax.Array,
     g_gamma: jax.Array,
@@ -123,7 +119,7 @@ def chunk_simple_gla_fwd_o_ref(
     return o
 
 
-def chunk_simple_gla_fwd_ref(
+def _chunk_simple_gla_fwd_ref(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -160,10 +156,10 @@ def chunk_simple_gla_fwd_ref(
     )
 
     # Stage 2: intra-chunk attention (Simple GLA)
-    A = chunk_simple_gla_fwd_intra_ref(q, k, g_gamma, scale, chunk_size=C)
+    A = _chunk_simple_gla_fwd_intra_ref(q, k, g_gamma, scale, chunk_size=C)
 
     # Stage 3: output (Simple GLA)
-    o = chunk_simple_gla_fwd_o_ref(q, v, g_gamma, A, h, scale, chunk_size=C)
+    o = _chunk_simple_gla_fwd_o_ref(q, v, g_gamma, A, h, scale, chunk_size=C)
 
     o = o[:, :T]
     return ht, o
@@ -216,7 +212,7 @@ def _chunk_simple_gla_fwd_intra_kernel(
     A_ref[0, 0] = b_A.astype(A_ref.dtype)
 
 
-def chunk_simple_gla_fwd_intra(
+def _chunk_simple_gla_fwd_intra(
     q: jax.Array,  # [B, T, H, K]
     k: jax.Array,  # [B, T, H, K]
     g_gamma: jax.Array,  # (1, 1, H, 1) or (H,)
@@ -332,7 +328,7 @@ def _chunk_simple_gla_fwd_o_kernel(
     o_ref[0, 0] = b_o.astype(o_ref.dtype)
 
 
-def chunk_simple_gla_fwd_o(
+def _chunk_simple_gla_fwd_o(
     q: jax.Array,  # [B, T, H, K]
     v: jax.Array,  # [B, T, H, V]
     A: jax.Array,  # [B, T, H, BT]
@@ -402,7 +398,7 @@ def chunk_simple_gla_fwd_o(
 # =============================================================================
 
 
-def chunk_simple_gla_pallas_fwd(
+def _chunk_simple_gla_pallas_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -441,7 +437,7 @@ def chunk_simple_gla_pallas_fwd(
 
     g_gamma_4d = g_gamma.reshape(1, 1, H, 1) if g_gamma is not None else None
     # Stage 1: Inter-chunk state propagation (reuse existing Pallas kernel)
-    h, ht = chunk_fwd_h_kernel(
+    h, ht = chunk_fwd_h(
         k=k,
         v=v,
         g=None,
@@ -455,10 +451,10 @@ def chunk_simple_gla_pallas_fwd(
     h = h.reshape(k.shape[0], -1, k.shape[2], k.shape[3], v.shape[-1])
 
     # Stage 2: Intra-chunk attention (Simple GLA Pallas kernel)
-    A = chunk_simple_gla_fwd_intra(q, k, g_gamma_4d, scale, chunk_size=C)
+    A = _chunk_simple_gla_fwd_intra(q, k, g_gamma_4d, scale, chunk_size=C)
 
     # Stage 3: Output combination (Simple GLA Pallas kernel)
-    o = chunk_simple_gla_fwd_o(q, v, A, h, g_gamma_4d, scale, chunk_size=C)
+    o = _chunk_simple_gla_fwd_o(q, v, A, h, g_gamma_4d, scale, chunk_size=C)
 
     return ht, o
 
@@ -478,22 +474,24 @@ def chunk_simple_gla_fwd(
     scale: float | None = None,
     h0: jax.Array | None = None,
     use_ht: bool = False,
-    cu_seqlens: jax.Array | None = None,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array | None]:
     B, T, H, K, V = *q.shape, v.shape[-1]
+    N = cu_seqlens_cpu.shape[0] - 1 if cu_seqlens_cpu is not None else B
 
-    assert (B, T, H, K) == k.shape
-    assert (B, T, H, V) == v.shape
-    assert (g is None) or ((B, T, H) == g.shape)
-    assert (g_gamma is None) or ((H,) == g_gamma.shape)
-    assert (h0 is None) or ((B, H, K, V) == h0.shape)
-    assert (cu_seqlens is None) or ((B + 1,) == cu_seqlens.shape)
+    # assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+    assert_shape_or_none(h0, (N, H, K, V))
     assert T % chunk_size == 0
-    assert (cu_seqlens is None) or (cu_seqlens % chunk_size == 0).all()
+    assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all()
     assert (K % 128 == 0) and (V % 128 == 0)
 
-    h, ht = chunk_fwd_h_kernel(
+    h, ht = chunk_fwd_h(
         k=k,
         v=v,
         g=g,
@@ -503,8 +501,10 @@ def chunk_simple_gla_fwd(
         h0=h0,
         output_final_state=use_ht,
         states_in_fp32=False,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
+        interpret=not is_tpu_runtime(),
     )
     o = chunk_fwd_o(
         q=q,
@@ -514,7 +514,8 @@ def chunk_simple_gla_fwd(
         g_gamma=g_gamma,
         h=h,
         scale=scale,
-        cu_seqlens_cpu=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
     )
     return o, ht
@@ -534,16 +535,19 @@ def _build_gk_from_gamma(g_gamma: jax.Array, B: int, T: int, H: int, K: int, chu
     # broadcast to [B, T, H, K]
     return jnp.broadcast_to(gc[None, :, :, None], (B, T, H, K))
 
-
 def chunk_simple_gla_bwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    g_gamma: jax.Array,
-    scale: float,
-    initial_state: jax.Array | None,
     do: jax.Array,
-    dht: jax.Array | None,
+    *,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    scale: float | None = None,
+    h0: jax.Array | None = None,
+    dht: jax.Array | None = None,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
     """Simple GLA backward orchestrator (g_gamma only).
@@ -554,9 +558,11 @@ def chunk_simple_gla_bwd(
         v:  [B, T, H, V]
         g_gamma: [H] — fixed per-head log-decay
         scale: scaling factor
-        initial_state: [B, H, K, V] or None
+        h0: [B, H, K, V] or None — initial state
         do: [B, T, H, V] — output gradient
         dht: [B, H, K, V] or None — terminal state gradient
+        cu_seqlens_cpu: [B + 1] or None — cumulative sequence lengths on CPU
+        cu_seqlens_dev: [B + 1] or None — cumulative sequence lengths on device
         chunk_size: block size
 
     Returns:
@@ -565,45 +571,57 @@ def chunk_simple_gla_bwd(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+    N = cu_seqlens_cpu.shape[0] - 1 if cu_seqlens_cpu is not None else B
+    scale = K ** -0.5 if scale is None else scale
 
-    assert_shape(q, (B, T, H, K))
+    # =================== assert kernel requirements start ===================
+    # assert_shape(q, (B, T, H, K))
     assert_shape(k, (B, T, H, K))
     assert_shape(v, (B, T, H, V))
     assert_shape(do, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+    assert_shape_or_none(h0, (N, H, K, V))
+    assert_shape_or_none(dht, (N, H, K, V))
     assert K % 128 == 0 and V % 128 == 0
     assert T % C == 0
+    if cu_seqlens_cpu is not None:
+        assert (cu_seqlens_cpu % chunk_size == 0).all()
+    assert scale is not None # fix pylance check
+    # =================== assert kernel requirements done ===================
 
-    NT = T // C
+    interpret = not is_tpu_runtime()
 
-    # Build synthetic gk from g_gamma for kernels that need it
-    gk = _build_gk_from_gamma(g_gamma, B, T, H, K, C)
-
-    # 1. Recompute h via chunk_fwd_h_kernel
-    h, _ = chunk_fwd_h_kernel(
-        k, v,
-        g=None,
+    # 1. Recompute h via chunk_fwd_h
+    h, _ = chunk_fwd_h(
+        k=k,
+        v=v,
+        g=g,
         g_gamma=g_gamma,
         gk=None,
-        h0=initial_state,
+        h0=h0,
         output_final_state=False,
         chunk_size=C,
+        states_in_fp32=True,
+        cu_seqlens_dev=cu_seqlens_dev,
+        interpret=interpret,
     )
-    h = h.reshape(B, NT, H, K, V)
 
-    # 2. Compute dh via chunk_bwd_dh_kernel with synthetic gk
+    # 2. Compute dh via chunk_bwd_dh_kernel
     dh, dh0 = chunk_bwd_dh(
         q, k, v,
-        gk=gk,
+        g_gamma=g_gamma,
+        gk=None,
         do=do,
         dht=dht,
         scale=scale,
-        output_dh0=initial_state is not None,
+        output_dh0=h0 is not None,
         chunk_size=C,
+        interpret=interpret,
     )
-    dh = dh.reshape(B, NT, H, K, V)
-    if dh0 is not None:
-        dh0 = dh0.reshape(B, H, K, V)
 
+    # Build synthetic gk from g_gamma for kernels that need it
+    gk = _build_gk_from_gamma(g_gamma, B, T, H, K, C) if g_gamma is not None else None
     # 3. Compute A via existing intra-chunk attention with synthetic gk
     A = chunk_gla_fwd_intra_gk_ref(q, k, gk, scale, chunk_size=C)
 
@@ -611,6 +629,9 @@ def chunk_simple_gla_bwd(
     dq, dk, dv = chunk_simple_gla_bwd_o_pl(
         q, k, v, g_gamma, h, A, do, dh,
         scale=scale, chunk_size=C,
+        interpret=interpret,
     )
 
     return dq, dk, dv, dh0
+
+__all__ = export_public(globals())

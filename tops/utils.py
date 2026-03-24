@@ -1,7 +1,8 @@
+import types
+
 import jax
 import jax.numpy as jnp
 from functools import singledispatch
-
 
 def next_power_of_2(n: int):
     """Return the smallest power of 2 greater than or equal to n"""
@@ -121,3 +122,27 @@ def assert_shape(x: jax.Array | list[jax.Array] | tuple[jax.Array, ...],
             assert tensor.shape == expected_shape, f"[{curr_name}] Expected shape {expected_shape}, got {tensor.shape}"
     else:
         assert x.shape == expected_shape, f"[{name}] Expected shape {expected_shape}, got {x.shape}"
+
+def export_public(current_globals):
+    """
+    """
+    public_members = []
+
+    module_name = current_globals.get('__name__')
+
+    for name, obj in current_globals.items():
+        if name.startswith('_'):
+            continue
+
+        if hasattr(obj, '__module__') and obj.__module__ != module_name:
+            continue
+
+        if isinstance(obj, types.ModuleType):
+            continue
+
+        if name == 'export_public':
+            continue
+
+        public_members.append(name)
+
+    return public_members

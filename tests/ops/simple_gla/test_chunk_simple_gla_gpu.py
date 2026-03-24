@@ -1,4 +1,4 @@
-"""chunk_simple_gla_fwd: FLA Triton GPU vs JAX chunk implementation."""
+"""chunk_simple_gla: forward (Triton vs JAX) & backward (Torch CPU vs JAX)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd
+from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd, chunk_simple_gla_bwd
+from tests.src.ops.simple_gla.chunk import chunk_simple_gla_bwd as cpu_bwd
 from tests.utils import compare_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -193,6 +194,94 @@ def test_triton_chunk_vs_jax_chunk(cfg):
     assert compare_tensor("output", o_tri, o_jax, atol=atol, rtol=rtol, max_ulp=max_ulp)
     if ht_tri is not None and ht_jax is not None:
         assert compare_tensor("final_state", ht_tri, ht_jax, atol=atol, rtol=rtol, max_ulp=max_ulp)
+
+
+# ============================================================================
+# Backward: JAX Pallas vs Torch CPU reference (g_gamma only)
+# ============================================================================
+
+BWD_CASES = [
+    dict(B=2, T=64, H=4, K=128, V=128, seed=42),
+    dict(B=1, T=128, H=2, K=128, V=128, seed=7),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=13, h0=True),
+    dict(B=2, T=64, H=1, K=128, V=128, seed=10),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=20),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=21),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=400),
+    dict(B=1, T=64, H=2, K=128, V=128, seed=41),
+    dict(B=1, T=256, H=2, K=128, V=128, seed=300),
+    dict(B=4, T=64, H=8, K=128, V=128, seed=99),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=502, chunk_size=32),
+    dict(B=2, T=128, H=4, K=128, V=128, seed=503, chunk_size=64),
+]
+
+
+def _bwd_case_id(c):
+    parts = [f"B{c['B']}_T{c['T']}_H{c['H']}_K{c['K']}_V{c['V']}"]
+    cs = c.get("chunk_size", 16)
+    if cs != 16:
+        parts.append(f"C{cs}")
+    if c.get("h0"):
+        parts.append("h0")
+    if c.get("dht"):
+        parts.append("dht")
+    return "-".join(parts)
+
+
+@pytest.mark.parametrize("cfg", BWD_CASES, ids=[_bwd_case_id(c) for c in BWD_CASES])
+def test_simple_gla_bwd_gamma(cfg):
+    """JAX chunk_simple_gla_bwd should match Torch CPU reference (g_gamma only)."""
+    B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]
+    scale = cfg.get("scale", K**-0.5)
+    C = cfg.get("chunk_size", 16)
+
+    torch.manual_seed(cfg["seed"])
+    q = torch.randn(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, H, V)
+    do = torch.randn(B, T, H, V)
+    g_gamma = -torch.rand(H).abs() * 0.5  # negative log-decay
+
+    N = B
+    h0 = torch.randn(N, H, K, V) if cfg.get("h0") else None
+    dht = torch.randn(N, H, K, V) if cfg.get("dht") else None
+
+    # Torch CPU reference (g_gamma only, no g)
+    dq_cpu, dk_cpu, dv_cpu, dg_cpu, dh0_cpu = cpu_bwd(
+        q.float(), k.float(), v.float(),
+        g=None,
+        g_gamma=g_gamma.float(),
+        scale=scale,
+        initial_state=h0,
+        do=do.float(),
+        dht=dht,
+        chunk_size=C,
+    )
+
+    # JAX Pallas
+    q_j = _torch_to_jax(q)
+    k_j = _torch_to_jax(k)
+    v_j = _torch_to_jax(v)
+    do_j = _torch_to_jax(do)
+    g_gamma_j = _torch_to_jax(g_gamma)
+    h0_j = _torch_to_jax(h0) if h0 is not None else None
+    dht_j = _torch_to_jax(dht) if dht is not None else None
+
+    dq_jax, dk_jax, dv_jax, dh0_jax = chunk_simple_gla_bwd(
+        q_j, k_j, v_j, do_j,
+        g_gamma=g_gamma_j,
+        scale=scale,
+        h0=h0_j,
+        dht=dht_j,
+        chunk_size=C,
+    )
+
+    atol, rtol = 2e-5, 1e-5
+    assert compare_tensor("dq", dq_cpu, dq_jax, atol=atol, rtol=rtol)
+    assert compare_tensor("dk", dk_cpu, dk_jax, atol=atol, rtol=rtol)
+    assert compare_tensor("dv", dv_cpu, dv_jax, atol=atol, rtol=rtol)
+    if dh0_cpu is not None:
+        assert compare_tensor("dh0", dh0_cpu, dh0_jax, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

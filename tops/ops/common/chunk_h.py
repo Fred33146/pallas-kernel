@@ -1,10 +1,13 @@
-import jax
-import jax.numpy as jnp
-from jax import lax
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 import functools
+
+import jax
+import jax.lax as lax
+import jax.numpy as jnp
+import jax.experimental.pallas as pl
+import jax.experimental.pallas.tpu as pltpu
+
 from tops.ops.utils import exp
+from tops.utils import assert_shape, assert_shape_or_none, export_public
 
 
 def _build_chunk_map(cu_seqlens, T_sum, BT):
@@ -135,7 +138,7 @@ def check_chunk_fwd(x):
     ],
 )
 def chunk_fwd_h_kernel(
-    k: jax.Array,  # [B,T,H,K]
+    k: jax.Array,
     v: jax.Array,  # [B,T,H,V]
     *,
     g: jax.Array | None = None,  # [B,T,H]
@@ -144,34 +147,66 @@ def chunk_fwd_h_kernel(
     gv: jax.Array | None = None,  # [B,T,H,V]
     h0: jax.Array | None = None,  # [N,H,K,V]
     output_final_state: bool = False,
-    cu_seqlens: jax.Array | None = None,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
     split_size: int | None = None,
     states_in_fp32: bool = False,
     interpret: bool = False,
 ):
-    check_chunk_fwd(gv)
     # todo: tune bk and bv for bast performance
     BK = 128
     BV = 128
     B, T, H, K, V = *k.shape, v.shape[-1]
+    N = B if cu_seqlens_cpu is None else cu_seqlens_cpu.shape[-1] - 1
+    BT = chunk_size
+    BS = BT if split_size is None else split_size
+
+    # =================== assert kernel requirements start ===================
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+    assert_shape_or_none(gk, (B, T, H, K))
+    # assert_shape_or_none(gv, (B, T, H, V))
+    assert gv is None, "gv is currently not supported"
+    assert_shape_or_none(h0, (N, H, K, V))
+
     assert K % 128 == 0, "K % 128 must equal to 0."
     assert V % 128 == 0, "V % 128 must equal to 0."
     assert T % chunk_size == 0, "T mod chunk_size must equal to 0."
+    if cu_seqlens_cpu is not None:
+        assert cu_seqlens_cpu[0] == 0, "cu_seqlens must start with 0."
+        assert (cu_seqlens_cpu % chunk_size == 0).all(), "cu_seqlens must be multiples of chunk_size."
 
-    BT = chunk_size
-    BS = BT if split_size is None else split_size
     assert BS % BT == 0, (
         f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     )
+    # =================== assert kernel requirements done ===================
+
+    # In interpret mode (CPU/GPU), use the pure JAX reference implementation
+    # to avoid Pallas interpret-mode tracing bugs with lax.fori_loop + lax.cond
+    # + nonlocal side effects that corrupt g_gamma computation for H>1.
+    if interpret:
+        h_all, ht_ref = chunk_fwd_h_ref(
+            k, v, g=g, g_gamma=g_gamma, gk=gk, gv=gv,
+            h0=h0, output_final_state=output_final_state,
+            states_in_fp32=states_in_fp32,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+        )
+        if output_final_state:
+            return h_all, ht_ref
+        return h_all, None
+
     # N: the actual number of sequences in the batch with either equal or variable lengths
-    if cu_seqlens is None:
-        cu_seqlens = jnp.arange(B * T + 1, step=T)
+    if cu_seqlens_dev is None:
+        cu_seqlens_dev = jnp.arange(B * T + 1, step=T)
     T_sum = B * T
-    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens, T_sum=T_sum, BT=BT)
+    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens_dev, T_sum=T_sum, BT=BT)
 
     N, NS = (
-        len(cu_seqlens) - 1,
+        len(cu_seqlens_dev) - 1,
         T_sum // BS,
     )  # split_offsets[-1] # NS number of chunk_size
 
@@ -268,7 +303,10 @@ def chunk_fwd_h_kernel(
             vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
-    )(k, v, h0, gk, g, g_gamma, cu_seqlens, chunk_to_seq)
+    )(k, v, h0, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
+    h = h.reshape(B, -1, H, K, V)
+    ht = ht.reshape(N, H, K, V) if ht is not None else None
+
     if output_final_state:
         return h, ht
     return h, None
@@ -694,4 +732,8 @@ def chunk_bwd_dh_kernel(
         ),
     )(q, do, dht, gk, g, g_gamma, cu_seqlens, chunk_to_seq)
 
+    dh_all = dh_all.reshape(B, -1, H, K, V)
+    dh0 = dh0.reshape(N, H, K, V) if dh0 is not None else None
     return dh_all, dh0
+
+__all__ = export_public(globals())

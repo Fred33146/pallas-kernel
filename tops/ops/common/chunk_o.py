@@ -13,8 +13,10 @@ import functools
 import jax
 import jax.numpy as jnp
 import jax.experimental.pallas as pl
-from jax.experimental.pallas import tpu as pltpu
+import jax.experimental.pallas.tpu as pltpu
+
 from tops.ops.utils import exp
+from tops.utils import assert_shape, assert_shape_or_none
 
 def chunk_simple_gla_bwd_kernel(
     q_ref, k_ref, v_ref, g_gamma_ref, h_ref, a_ref, do_ref, dh_ref,
@@ -102,6 +104,7 @@ def chunk_simple_gla_bwd_o_pl(
     dh: jax.Array,  # [B, NT, H, K, V]
     scale: float,
     chunk_size: int,
+    interpret: bool = False,
 ):
     """Launcher for the fused simple GLA backward kernel.
 
@@ -132,7 +135,7 @@ def chunk_simple_gla_bwd_o_pl(
     spec_V = pl.BlockSpec([1, 1, BT, V], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_h = pl.BlockSpec([1, 1, K, V], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_A = pl.BlockSpec([1, 1, BT, BT], index_map=lambda h, nt: (h, nt, 0, 0))
-    spec_gamma = pl.BlockSpec(memory_space=pltpu.SMEM)
+    spec_gamma = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
     dq_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], q.dtype)
     dk_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], k.dtype)
@@ -147,6 +150,7 @@ def chunk_simple_gla_bwd_o_pl(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=32 * 1024 * 1024,
         ),
+        interpret=interpret,
     )(_q, _k, _v, g_gamma, _h, _A, _do, _dh)
 
     # Post-process: (H, total_NT, BT, D) -> (B, T, H, D)
@@ -163,15 +167,16 @@ def chunk_simple_gla_bwd_o_pl(
     return dq, dk, dv
 
 def chunk_fwd_o(
-    q: jax.Array,       # [B, T, H, K]
-    k: jax.Array,       # [B, T, H, K]
-    v: jax.Array,       # [B, T, H, V]
-    h: jax.Array,       # [NT_total, H, K, V]
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    h: jax.Array,
     *,
-    g: jax.Array | None = None,        # [B, T, H] chunk-local cumsum of scalar gate
-    g_gamma: jax.Array | None = None,  # [H] per-head fixed decay rate
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
     scale: float | None = None,
     cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
 ) -> jax.Array:
     """Chunk forward output computation (pure JAX reference).
@@ -192,9 +197,17 @@ def chunk_fwd_o(
     if scale is None:
       scale = K ** -0.5
 
-    assert scale is not None
+    # =================== assert kernel requirements start ===================
+    # assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+
     assert T % C == 0, f"Sequence length T={T} must be divisible by chunk_size={C}"
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all(), "All sequence lengths must be divisible by chunk_size"
+    assert scale is not None # fix pylance check
+    # =================== assert kernel requirements done ===================
 
     h = h.reshape(B, NT, H, K, V)
 
