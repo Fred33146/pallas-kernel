@@ -40,8 +40,11 @@ The current package-level dependency tree (ordered bottom-up):
     *   Complex refactoring or modifications should be documented in the `docs/exec-plans/` directory.
     *   **Kernel Design Constraints**: For core Kernels (especially complex Pallas operators), **it is strictly required that all Kernels (whether legacy or newly added) must have corresponding design documents added to or supplemented in `docs/design-docs/ops/` (including but not limited to formulas, memory layouts, Tiling strategies, and hardware abstractions).** These act as the sole source of truth for development and refactoring. Any maintenance on a Kernel must be based on a pre-existing design document.
 *   **Taste & Review Rules (Golden Rules)**:
-    1.  **Exhaustive Business & Dimensional Constraints**: All public APIs **must** clearly define tensor dimensional semantics and data flow patterns.
-    2.  **Strict Fail-Fast & Assertion Mechanisms**: We encourage as many rigorous tensor and condition assertions as possible. As an absolute baseline constraint, **all public compute interfaces/operator functions must not be in a "Zero Asserts" state**. At least one basic shape or condition check (using `assert` or `assert_shape_or_none`, etc.) must exist. We will enforce this baseline through static code analysis.
+    1.  **Strict Fail-Fast & Assertion Mechanisms**: We encourage as many rigorous tensor and condition assertions as possible. As an absolute baseline constraint, **all public compute interfaces/operator functions must not be in a "Zero Asserts" state**. At least one basic shape or condition check (using `assert` or `assert_shape_or_none`, etc.) must exist. We will enforce this baseline through static code analysis.
+    2.  **Mandatory external public API documentation**: All externally exposed public APIs must include complete comments/docstrings that explicitly define:
+        *   Tensor sizes and dimension semantics (input/output item-by-item);
+        *   Function business semantics and behavioral boundaries;
+        *   Data flow (how inputs transform into outputs and key intermediate state semantics).
 
 ---
 
@@ -57,6 +60,13 @@ The current package-level dependency tree (ordered bottom-up):
 *   **`tops/cpu/` is the default Gold/Reference**: Implementations under `tops/cpu/` are treated as canonical reference implementations. Any new Pallas/JAX implementation added under `tops/ops/` must, by default, align against `tops/cpu/` through reference-comparison tests.
 *   **How reference correctness is established**: The correctness of `tops/cpu/` must be continuously validated against `torch_gpu/torch_cpu` comparisons, so it remains a trustworthy baseline.
 *   **Default comparator and GPU-specific exception**: The default comparator is `tops/cpu/`. If GPU-based comparison is required (e.g., Torch/Triton), create a separate test file and append the `_gpu` suffix to its filename.
+
+---
+
+## 4. Release & Versioning Policy
+
+*   **External source-installation entry branch**: When external repositories install from source, `release_branch` must be used as the installation source branch.
+*   **Version bump rule**: Every release-content update on `release_branch` must bump the project version (for example, the version field in `pyproject.toml`). Releasing changed content without a version bump is not allowed.
 
 ---
 
