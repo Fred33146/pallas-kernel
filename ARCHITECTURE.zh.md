@@ -45,6 +45,8 @@
         *   Tensor 形状与维度含义（输入/输出逐项说明）；
         *   函数业务语义与行为边界；
         *   数据流（输入如何变换为输出，关键中间状态的语义）。
+    3.  **Kernel 零崩溃保证（No-Crash-After-Assert）**：所有 Kernel 函数在通过入口断言（assert）校验之后，**设计上不允许出现任何运行时报错或 coredump**。即：若输入合法（未被 assert 拦截），则 Kernel 必须保证在任何合法输入条件下安全执行完毕并返回正确结果。断言是唯一允许的拒绝入口——通过了断言，就意味着承诺了执行安全。
+    4.  **强制边界用例覆盖（Mandatory Edge-Case Testing）**：所有 Kernel 对应的测试用例，**必须包含边界与极端输入场景的覆盖**，例如：超大 batch、超大 sequence length (token)、极小维度、非对齐尺寸等。这类边界用例的预期行为是以下两者之一：**（a）被入口 assert 明确拦截并抛出 `AssertionError`**，以此验证 Kernel 的防御性断言完整且有效；或者 **（b）Kernel 能够正确处理该输入并返回正确结果**。若某个超出设计范围的输入既未被 assert 捕获、也未被正确处理（例如产生 coredump、静默错误或数值异常），则视为缺陷，需修复。
 
 ## 3. 测试与验证 (Validation Boundaries)
 

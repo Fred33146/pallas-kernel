@@ -45,6 +45,8 @@ The current package-level dependency tree (ordered bottom-up):
         *   Tensor sizes and dimension semantics (input/output item-by-item);
         *   Function business semantics and behavioral boundaries;
         *   Data flow (how inputs transform into outputs and key intermediate state semantics).
+    3.  **Kernel No-Crash-After-Assert Guarantee**: Once a Kernel function passes its entry-point assertions, **it must never produce runtime errors or coredumps by design**. If the input is valid (not rejected by asserts), the Kernel must guarantee safe execution to completion with correct results under all valid input conditions. Assertions are the only permitted rejection gate — passing them constitutes a contract of execution safety.
+    4.  **Mandatory Edge-Case Testing**: All Kernel test suites **must include coverage of boundary and extreme input scenarios**, such as: very large batch sizes, very large sequence lengths (tokens), minimal dimensions, non-aligned sizes, etc. The expected behavior for these edge cases must be one of: **(a) being explicitly caught by entry-point asserts and raising `AssertionError`**, thereby validating that the Kernel's defensive assertions are complete and effective; or **(b) the Kernel correctly handles the input and returns correct results**. If an out-of-design-range input is neither caught by asserts nor handled correctly (e.g., resulting in a coredump, silent error, or numerical anomaly), it is treated as a defect that must be fixed.
 
 ---
 
