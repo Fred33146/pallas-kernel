@@ -97,7 +97,7 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
+          sizeLimit: 32Gi
         name: tmpfs
       - name: dshm
         emptyDir:
