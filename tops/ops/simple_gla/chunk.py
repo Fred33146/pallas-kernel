@@ -381,7 +381,6 @@ def _chunk_simple_gla_fwd_o(
             # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
-        interpret=interpret,
     )(_q, _v, _h, _A, g_gamma_1d)
 
     # Post-reshape: (H, total_NT, BT, V) -> (B, T, H, V)
@@ -629,7 +628,6 @@ def chunk_simple_gla_bwd(
         q, k, v, g_gamma, h, A, do, dh,
         scale=scale, chunk_size=C,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
 
     return dq, dk, dv, dh0
