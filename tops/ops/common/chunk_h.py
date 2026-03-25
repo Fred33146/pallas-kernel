@@ -18,6 +18,7 @@ def _build_chunk_map(cu_seqlens, T_sum, BT):
     return seq_idx
 
 
+
 def _chunk_fwd_h_kernel(
     k_ref,  # [1, 1, BT, BK]
     v_ref,  # [1, 1, BT, BV]
@@ -33,7 +34,7 @@ def _chunk_fwd_h_kernel(
     BS,
     NT,
 ):
-    
+
     BK = k_ref.shape[3]
     BV = v_ref.shape[3]
     NTS = BS // BT
@@ -54,7 +55,7 @@ def _chunk_fwd_h_kernel(
     def store_fn():
         i_s = i_t // NTS
         h_ref[0, i_s, 0] = scratch_ref[...]
-    
+
     k_tile = k_ref[(0, 0, slice(None), slice(None))] # BT * BK
     v_tile = v_ref[(0, 0, slice(None), slice(None))] # BT * BV
 
@@ -76,7 +77,7 @@ def _chunk_fwd_h_kernel(
         decay = exp(g_last)
         scratch_ref[...] = scratch_ref[...] * decay[:, None]  # [BK, BV] * [BK,1]
         k_tile = (k_tile * exp(g_last[None, :] - gk_tile)).astype(k_tile.dtype)
-    
+
     scratch_ref[...] = scratch_ref[...] + jax.lax.dot(
             k_tile.astype(jnp.float32).T,
             v_tile.astype(jnp.float32),
@@ -193,7 +194,7 @@ def chunk_fwd_h_kernel(
 
     def gk_index_map(batch_index, head_index,  k_index, _, t_index):
         return batch_index, head_index, t_index, k_index
-    
+
     def g_index_map(batch_index, head_index,  k_index, _, t_index):
         return batch_index, head_index, t_index, 0
 
@@ -208,7 +209,7 @@ def chunk_fwd_h_kernel(
 
     def ht_index_map(batch_index, head_index, k_index, v_index, _):
         return batch_index, head_index, k_index, v_index
-        
+
 
     out_shape = [
         jax.ShapeDtypeStruct(
@@ -286,6 +287,94 @@ def chunk_fwd_h_kernel(
     return h, None
 
 
+def _chunk_fwd_h_scan(k, v, g, g_gamma, gk, h0,
+                      output_final_state, states_in_fp32,
+                      C, B, T, H, K, V, NT):
+    """lax.scan-based forward state propagation for fixed-length sequences.
+
+    Replaces the Python for-loop in chunk_fwd_h_ref to avoid XLA
+    trace-time loop unrolling (which creates a huge HLO graph).
+    """
+    h_dtype = jnp.float32 if states_in_fp32 else k.dtype
+    has_g = g is not None
+    has_gk = gk is not None
+
+    # Reshape into chunks: [B, NT, C, H, D] then [NT, B, C, H, D] for scan
+    k_scan = k.reshape(B, NT, C, H, K).transpose(1, 0, 2, 3, 4)
+    v_scan = v.reshape(B, NT, C, H, V).transpose(1, 0, 2, 3, 4)
+
+    scan_inputs = (k_scan, v_scan)
+    if has_g:
+        g_scan = g.reshape(B, NT, C, H).transpose(1, 0, 2, 3)
+        scan_inputs += (g_scan,)
+    if has_gk:
+        gk_scan = gk.reshape(B, NT, C, H, K).transpose(1, 0, 2, 3, 4)
+        scan_inputs += (gk_scan,)
+
+    # Precompute g_gamma decay terms (constant across chunks)
+    if g_gamma is not None:
+        g_gamma_f32 = g_gamma.astype(jnp.float32)
+        g_last_gamma = g_gamma_f32 * C  # [H]
+        state_decay = jnp.exp(g_last_gamma)  # [H]
+        b_g_gamma = g_gamma_f32[None, :] * (jnp.arange(C, dtype=jnp.float32) + 1)[:, None]  # [C, H]
+        v_decay = jnp.exp(g_last_gamma[None, :] - b_g_gamma)  # [C, H]
+
+    def scan_fn(h, chunk_data):
+        # Unpack scan inputs (structure determined at trace time)
+        idx = 0
+        b_k = chunk_data[idx]; idx += 1
+        b_v = chunk_data[idx]; idx += 1
+        if has_g:
+            b_g_scalar = chunk_data[idx]; idx += 1
+        if has_gk:
+            b_gk = chunk_data[idx]
+
+        h_out = h  # state BEFORE update
+
+        # Scalar gate g: [B, C, H]
+        if has_g:
+            b_g_last = b_g_scalar[:, -1, :]  # [B, H]
+            h = h * jnp.exp(b_g_last.astype(jnp.float32))[:, :, None, None]
+            b_v = (b_v * jnp.exp((b_g_last[:, None, :] - b_g_scalar).astype(jnp.float32))[:, :, :, None]).astype(b_v.dtype)
+
+        # Per-head fixed decay g_gamma
+        if g_gamma is not None:
+            h = h * state_decay[None, :, None, None]
+            b_v = (b_v * v_decay[None, :, :, None]).astype(b_v.dtype)
+
+        # Per-K-dim gate gk: [B, C, H, K]
+        if has_gk:
+            b_gk_last = b_gk[:, -1, :, :]  # [B, H, K]
+            h = h * jnp.exp(b_gk_last.astype(jnp.float32))[:, :, :, None]
+            b_k = b_k * jnp.exp((b_gk_last[:, None, :, :] - b_gk).astype(jnp.float32))
+
+        # State update: h += k^T @ v  (contract C, batch B and H)
+        kv = lax.dot_general(
+            b_k.astype(jnp.float32),
+            b_v.astype(jnp.float32),
+            dimension_numbers=(((1,), (1,)), ((0, 2), (0, 2))),
+            precision=lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        h = h + kv
+        return h, h_out
+
+    # Initial state: [B, H, K, V]  (N = B for fixed-length)
+    h_init = jnp.zeros((B, H, K, V), dtype=jnp.float32)
+    if h0 is not None:
+        h_init = h0.reshape(B, H, K, V).astype(jnp.float32)
+
+    h_final, h_all = lax.scan(scan_fn, h_init, scan_inputs)
+    # h_all: [NT, B, H, K, V] -> [B, NT, H, K, V]
+    h_all = h_all.transpose(1, 0, 2, 3, 4).astype(h_dtype)
+
+    ht = None
+    if output_final_state:
+        ht = h_final.astype(jnp.float32)  # [B, H, K, V]
+
+    return h_all, ht
+
+
 def chunk_fwd_h_ref(
     k: jax.Array,
     v: jax.Array,
@@ -333,6 +422,14 @@ def chunk_fwd_h_ref(
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % C == 0).all(), (
         "cu_seqlens must be multiples of chunk_size for chunk_fwd_h"
     )
+
+    # Fast path: fixed-length sequences use lax.scan (avoids XLA loop unrolling)
+    if cu_seqlens_cpu is None and gv is None:
+        return _chunk_fwd_h_scan(
+            k, v, g, g_gamma, gk, h0,
+            output_final_state, states_in_fp32,
+            C, B, T, H, K, V, NT,
+        )
 
     k = k.reshape(-1, H, K)
     v = v.reshape(-1, H, V)
