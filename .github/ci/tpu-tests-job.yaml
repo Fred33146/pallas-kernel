@@ -1,0 +1,104 @@
+# CI TPU Tests - K8s Manifests
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL
+# Runs pallas-kernel pytest suite on TPU v7
+---
+# Headless Service for TPU pod DNS resolution (required for JAX coordinator)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}-headless-svc
+  namespace: default
+  labels:
+    app: ci-pallas-kernel-tests
+    ci-branch: "${BRANCH_LABEL}"
+spec:
+  clusterIP: None
+  selector:
+    job-name: ${JOB_NAME}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  labels:
+    app: ci-pallas-kernel-tests
+    ci-branch: "${BRANCH_LABEL}"
+    job-name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: ci-pallas-kernel-tests
+        ci-branch: "${BRANCH_LABEL}"
+        job-name: ${JOB_NAME}
+    spec:
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # 1. Clone repo at specific ref
+          git clone --depth=1 -b "${BRANCH}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/pallas-kernel.git" \
+            /workspace
+          cd /workspace
+
+          # 2. Install dependencies
+          pip install uv
+          uv pip install -e '.[tpu]' --system
+          uv pip install pytest --system
+
+          # 3. Run tests (exclude gla for now, only simple_gla + modules + layers)
+          pytest tests/ --ignore=tests/ops/gla/ --ignore=tests/ops/ref/ -v
+        env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${JOB_NAME}-token
+              key: token
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        - name: TPU_PROCESS_ADDRESSES
+          value: ${JOB_NAME}-0.${JOB_NAME}-headless-svc:8476
+        - name: TPU_PROCESS_PORT
+          value: "8476"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            ephemeral-storage: 20Gi
+            google.com/tpu: "4"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      restartPolicy: Never
+      serviceAccountName: gcs-account
+      subdomain: ${JOB_NAME}-headless-svc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: tmpfs
+      - name: dshm
+        emptyDir:
+          medium: Memory

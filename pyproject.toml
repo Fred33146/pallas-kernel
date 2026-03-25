@@ -61,6 +61,24 @@ torch = [
 torchvision = [{ index = "pytorch-cu126", extra = "gpu" }]
 
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "tpu_only: test requires TPU hardware",
+  "gpu_only: test requires GPU/CUDA hardware",
+  "cpu_only: test runs only on CPU",
+]
+addopts = [
+  "--strict-markers",
+  "--ignore=tests/ops/simple_gla/test_simple_gla_gpu.py",
+  "--ignore=tests/ops/simple_gla/test_simple_gla_bwd_gpu.py",
+  "--ignore=tests/ops/simple_gla/test_chunk_simple_gla_gpu.py",
+  "--ignore=tests/ops/simple_gla/test_chunk_simple_gla_bwd_gpu.py",
+  "--ignore=tests/layers/test_torch_gla.py",
+  "--ignore=tests/ops/test_torch_fused_recurrent_bwd.py",
+  "--ignore=tests/ops/test_gla.py",
+]
+
 [tool.ruff]
 indent-width = 2
 ignore = ["E712","E741","F841"]
