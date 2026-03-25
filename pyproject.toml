@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "tops"
-version = "0.1.1"
+dynamic = ["version"]
 description = "JAX/Flax Pallas kernels for Gated Linear Attention (GLA)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -85,3 +85,9 @@ ignore = ["E712","E741","F841"]
 
 [tool.ruff.format]
 indent-style = "space"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "tops/_version.py"

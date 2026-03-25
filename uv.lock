@@ -2476,7 +2476,6 @@ wheels = [
 
 [[package]]
 name = "tops"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "einops" },
@@ -2521,7 +2520,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'gpu'", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "tops", extra = "gpu" } },
     { name = "xprof", marker = "extra == 'profile'", specifier = "==2.22.0" },
 ]
-provides-extras = ["dev", "gpu", "tpu", "profile"]
+provides-extras = ["dev", "gpu", "profile", "tpu"]
 
 [[package]]
 name = "torch"

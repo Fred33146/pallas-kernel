@@ -67,8 +67,23 @@ The current package-level dependency tree (ordered bottom-up):
 
 ## 4. Release & Versioning Policy
 
-*   **External source-installation entry branch**: When external repositories install from source, `release_branch` must be used as the installation source branch.
-*   **Version bump rule**: Every release-content update on `release_branch` must bump the project version (for example, the version field in `pyproject.toml`). Releasing changed content without a version bump is not allowed.
+The project uses an agile release strategy that combines "Trunk-based Development" and "Release Branches" to balance development efficiency with the stability of downstream dependencies (e.g., `ant-pretrain`).
+
+### 4.1 Release Flow
+
+1.  **Periodic Cut-off (RC Tag)**: When functionality on the `main` branch is ready for delivery, a `vX.Y.Z-rc.N` tag is created on `main` (e.g., `v1.0.0-rc.1`).
+2.  **Pull Release Branch**: A release branch `release/vX.Y` (e.g., `release/v1.0`) is created based on the RC Tag. This branch serves as a "protective umbrella" for bug fixes during integration testing.
+3.  **Integration Testing & Fixing**: Downstream projects (like `ant-pretrain`) depend on the RC version for testing. If bugs are found:
+    *   Fixes are submitted to the `release/vX.Y` branch.
+    *   **Mandatory**: Fixes must be cherry-picked back to the `main` branch to prevent regressions in future versions.
+    *   A new RC Tag (e.g., `v1.0.0-rc.2`) is created on the release branch for further verification.
+4.  **Final Promotion (Final Tag)**: Once downstream verification is complete and an RC version is confirmed stable, a final tag without a suffix (e.g., `v1.0.0`) is created on the release branch.
+
+### 4.2 Versioning & Installation Rules
+
+*   **External Source-Installation**: External repositories must use the `release/vX.Y` branch or its corresponding stable Tag as the installation source.
+*   **Version Bump Rule**: Every release update must synchronously bump the project version (e.g., the version field in `pyproject.toml`). Releasing changed content without a version bump is strictly prohibited.
+*   **Use of RC Suffix**: The `-rc.N` suffix is mandatory during the testing phase before a formal release to clearly indicate that the version has not been fully system-tested.
 
 ---
 
