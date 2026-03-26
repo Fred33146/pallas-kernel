@@ -13,7 +13,7 @@ import torch
 import jax
 import jax.numpy as jnp
 
-from tops.ops.gla import chunk_local_cumsum as pallas_chunk_local_cumsum
+from tops.ops.common.cumsum import chunk_local_cumsum_vector
 from tops.utils import prepare_chunk_indices
 from tests.utils import compare_tensor
 
@@ -257,6 +257,50 @@ PALLAS_CASES = [
         chunk_indices=None,
         seed=87,
     ),
+    # ---- large fixed-length, head_first=True ----
+    dict(
+        B=8,
+        T=1024,
+        H=64,
+        K=128,
+        chunk_size=64,
+        reverse=False,
+        scale=None,
+        cu_seqlens=None,
+        head_first=True,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=88,
+    ),
+    # ---- large varlen, head_first=False ----
+    dict(
+        B=1,
+        T=1024,
+        H=16,
+        K=128,
+        chunk_size=64,
+        reverse=False,
+        scale=None,
+        cu_seqlens=[0, 512, 888, 1024],
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=89,
+    ),
+    dict(
+        B=1,
+        T=2048,
+        H=64,
+        K=128,
+        chunk_size=128,
+        reverse=False,
+        scale=None,
+        cu_seqlens=[0, 512, 888, 2048],
+        head_first=False,
+        output_dtype=jnp.float32,
+        chunk_indices=None,
+        seed=89,
+    ),
 ]
 
 
@@ -408,7 +452,7 @@ def _run_pallas(
     output_dtype=None,
     chunk_indices=None,
 ):
-    return pallas_chunk_local_cumsum(
+    return chunk_local_cumsum_vector(
         g,
         chunk_size=chunk_size,
         scale=scale,
@@ -467,3 +511,4 @@ def test_cpu_vs_pallas(cfg):
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
