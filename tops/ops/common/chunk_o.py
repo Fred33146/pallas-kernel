@@ -19,7 +19,7 @@ from tops.ops.utils import exp
 from tops.utils import assert_shape, assert_shape_or_none
 
 def chunk_simple_gla_bwd_kernel(
-    q_ref, k_ref, v_ref, g_gamma_ref, h_ref, a_ref, do_ref, dh_ref,
+    q_ref, k_ref, v_ref, g_gamma_ref, h_ref, do_ref, dh_ref,
     dq_ref, dk_ref, dv_ref,
     *,
     BT: int,
@@ -27,13 +27,15 @@ def chunk_simple_gla_bwd_kernel(
 ):
     """Fused backward kernel for simple GLA with g_gamma.
 
+    A (intra-chunk attention) is recomputed in-kernel from q, k, g_gamma
+    to avoid materializing the full [B, T, H, C] tensor.
+
     Grid: (H, total_NT)
     Refs (after block spec indexing):
       q_ref/k_ref: (1, 1, BT, K)
       v_ref/do_ref: (1, 1, BT, V)
       g_gamma_ref: [H] in SMEM
       h_ref/dh_ref: (1, 1, K, V)
-      a_ref: (1, 1, BT, BT)
       dq_ref/dk_ref: (1, 1, BT, K)
       dv_ref: (1, 1, BT, V)
     """
@@ -41,7 +43,6 @@ def chunk_simple_gla_bwd_kernel(
     b_k = k_ref[0, 0]    # (BT, K)
     b_v = v_ref[0, 0]    # (BT, V)
     b_h = h_ref[0, 0].astype(jnp.float32)    # (K, V)
-    b_a = a_ref[0, 0].astype(jnp.float32)    # (BT, BT)
     b_do = do_ref[0, 0]  # (BT, V)
     b_dh = dh_ref[0, 0].astype(jnp.float32)  # (K, V)
 
@@ -51,9 +52,19 @@ def chunk_simple_gla_bwd_kernel(
     b_g = b_gamma * (jnp.arange(BT) + 1).astype(jnp.float32)  # [BT]
     b_gn = b_g[BT - 1]  # scalar — last position decay
 
+    # Recompute A in-kernel: A = (q @ k^T) * scale * decay
+    pos = (jnp.arange(BT) + 1).astype(jnp.float32)
+    decay = jnp.exp(b_gamma * (pos[:, None] - pos[None, :]))
+    b_a = jnp.dot(
+        b_q, b_k.T,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ) * scale * decay
+
     # 1. dA = do @ v^T * scale, masked lower-triangular
     b_A_do = b_do.astype(b_v.dtype)
-    b_dA = jnp.dot(b_A_do, b_v.T, precision=jax.lax.Precision.HIGHEST,
+    b_dA = jnp.dot(b_A_do, b_v.T, 
+                   precision=jax.lax.Precision.HIGHEST,
                     preferred_element_type=jnp.float32) * scale
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_dA = jnp.where(mask, b_dA, 0.0)
@@ -99,7 +110,6 @@ def chunk_simple_gla_bwd_o_pl(
     v: jax.Array,   # [B, T, H, V]
     g_gamma: jax.Array,  # [H]
     h: jax.Array,   # [B, NT, H, K, V]
-    A: jax.Array,   # [B, T, H, BT]
     do: jax.Array,  # [B, T, H, V]
     dh: jax.Array,  # [B, NT, H, K, V]
     scale: float,
@@ -109,6 +119,8 @@ def chunk_simple_gla_bwd_o_pl(
     interpret: bool = False,
 ):
     """Launcher for the fused simple GLA backward kernel.
+
+    A is recomputed inside the kernel from q, k, g_gamma.
 
     Returns: (dq, dk, dv)
     """
@@ -126,7 +138,6 @@ def chunk_simple_gla_bwd_o_pl(
     _k = _reshape_bt(k, K)
     _v = _reshape_bt(v, V)
     _do = _reshape_bt(do, V)
-    _A = A.reshape(B, NT, BT, H, BT).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, BT)
     # h/dh: [B, NT, H, K, V] -> [H, total_NT, K, V]
     _h = h.transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
     _dh = dh.transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
@@ -136,7 +147,6 @@ def chunk_simple_gla_bwd_o_pl(
     spec_K = pl.BlockSpec([1, 1, BT, K], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_V = pl.BlockSpec([1, 1, BT, V], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_h = pl.BlockSpec([1, 1, K, V], index_map=lambda h, nt: (h, nt, 0, 0))
-    spec_A = pl.BlockSpec([1, 1, BT, BT], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_gamma = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
     dq_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], q.dtype)
@@ -147,13 +157,13 @@ def chunk_simple_gla_bwd_o_pl(
         functools.partial(chunk_simple_gla_bwd_kernel, BT=BT, scale=scale),
         grid=grid,
         out_shape=[dq_shape, dk_shape, dv_shape],
-        in_specs=[spec_K, spec_K, spec_V, spec_gamma, spec_h, spec_A, spec_V, spec_h],
+        in_specs=[spec_K, spec_K, spec_V, spec_gamma, spec_h, spec_V, spec_h],
         out_specs=[spec_K, spec_K, spec_V],
         compiler_params=pltpu.CompilerParams(
             # vmem_limit_bytes=32 * 1024 * 1024,
         ),
         interpret=interpret,
-    )(_q, _k, _v, g_gamma, _h, _A, _do, _dh)
+    )(_q, _k, _v, g_gamma, _h, _do, _dh)
 
     # Post-process: (H, total_NT, BT, D) -> (B, T, H, D)
     def _unreshape(x, D):
@@ -222,10 +232,14 @@ def chunk_fwd_o(
     # Inter-chunk: Q_c @ H_c -> [B, NT, H, C, V]
     o_inter = jnp.zeros((B, NT, H, C, V), dtype=jnp.float32)
     A = jnp.zeros((B, NT, H, C, C), dtype=jnp.float32)
-    o_inter += jnp.matmul(q_c, h, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    o_inter += jnp.matmul(q_c, h, 
+    precision=jax.lax.Precision.HIGHEST,
+    preferred_element_type=jnp.float32)
 
     # Intra-chunk: Q_c @ K_c^T -> [B, NT, H, C, C]
-    A += jnp.matmul(q_c, jnp.swapaxes(k_c, -2, -1), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    A += jnp.matmul(q_c, jnp.swapaxes(k_c, -2, -1), 
+    precision=jax.lax.Precision.HIGHEST,
+    preferred_element_type=jnp.float32)
 
     # Apply scalar gate g
     if g is not None:
@@ -245,7 +259,9 @@ def chunk_fwd_o(
     A = jnp.where(causal_mask, A, 0.0)
 
     # Intra: A @ V_c -> [B, NT, H, C, V]
-    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c, 
+    precision=jax.lax.Precision.HIGHEST,
+    preferred_element_type=jnp.float32)
 
     # Combine
     o = (o_inter + o_intra) * scale
@@ -299,14 +315,16 @@ def chunk_bwd_dv(
     # Inter-chunk: K_c @ dH -> [B, NT, H, C, V]
     dv_inter = jnp.matmul(
         k_c, dh,
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     # Intra-chunk attention: K_c @ Q_c^T -> [B, NT, H, C, C]
     # A[j, i] = k[j] @ q[i]^T  (note: row=key, col=query)
     A = jnp.matmul(
         k_c, jnp.swapaxes(q_c, -2, -1),
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     # Gate: g is chunk-local cumsum [B, T, H]
@@ -333,7 +351,8 @@ def chunk_bwd_dv(
     # Intra-chunk: A @ do -> [B, NT, H, C, V]
     dv_intra = jnp.matmul(
         A.astype(do_c.dtype), do_c,
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     dv = dv_inter + dv_intra
@@ -403,13 +422,15 @@ def chunk_bwd_dqkwg(
     # Inter-chunk: dq_inter = do @ h^T -> [B, NT, H, C, K]
     dq_inter = jnp.matmul(
         do_c, jnp.swapaxes(h, -2, -1),
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     # Inter-chunk: dk_inter = v @ dh^T -> [B, NT, H, C, K]
     dk_inter = jnp.matmul(
         v_c, jnp.swapaxes(dh, -2, -1),
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     # Delta Rule specific backward to w
@@ -418,14 +439,16 @@ def chunk_bwd_dqkwg(
         dv_c = dv.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)
         dw_c = jnp.matmul(
             dv_c, jnp.swapaxes(h, -2, -1),
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
         dw = -dw_c.transpose(0, 1, 3, 2, 4).reshape(B, T, H, K).astype(w.dtype)
 
     # Intra-chunk: ds = do @ v^T -> [B, NT, H, C, C]
     ds = jnp.matmul(
         do_c, jnp.swapaxes(v_c, -2, -1),
-        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
 
     # Causal mask (lower triangular: i >= j)
@@ -463,7 +486,8 @@ def chunk_bwd_dqkwg(
         # b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
         qk = jnp.matmul(
             q_c, jnp.swapaxes(k_c, -2, -1),
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
         ds2 = ds_gate * qk
 
@@ -475,11 +499,13 @@ def chunk_bwd_dqkwg(
         ds_cast = ds_gate.astype(k_c.dtype)
         dq_intra = jnp.matmul(
             ds_cast, k_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
         dk_intra = jnp.matmul(
             jnp.swapaxes(ds_cast, -2, -1), q_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
 
         dq = dq_gate + dq_intra
@@ -516,11 +542,13 @@ def chunk_bwd_dqkwg(
         ds_cast = ds.astype(k_c.dtype)
         dq_intra = jnp.matmul(
             ds_cast, k_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
         dk_intra = jnp.matmul(
             jnp.swapaxes(ds_cast, -2, -1), q_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
 
         dq = dq_inter + dq_intra
@@ -533,12 +561,14 @@ def chunk_bwd_dqkwg(
 
         dq_intra = jnp.matmul(
             ds_cast, k_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         )
         # Note: Triton applies scale to dk_intra * scale
         dk_intra = jnp.matmul(
             jnp.swapaxes(ds_cast, -2, -1), q_c,
-            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
         ) * scale
 
         dq = (dq_inter + dq_intra) * scale

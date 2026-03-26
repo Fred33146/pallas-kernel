@@ -1,7 +1,7 @@
 """Profile chunk_bwd_dh_kernel with xprof trace + LLO dump.
 
 Usage (on TPU):
-  export LIBTPU_INIT_ARGS="--xla_mosaic_dump_to=/tmp/mosaic_dumps --xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true"
+  export LIBTPU_INIT_ARGS="--xla_mosaic_dump_to=/tmp/mosaic_dumps --xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true --xla_jf_dump_to=/tmp/dump_llo/"
   python tests/ops/simple_gla/profile_chunk_bwd_dh.py
 
 Outputs:
@@ -22,7 +22,8 @@ import jax.numpy as jnp
 from tops.ops.common.chunk_h import chunk_bwd_dh_kernel
 import os
 os.environ["LIBTPU_INIT_ARGS"] = (
-    "--xla_mosaic_dump_to=/tmp/mosaic_dumps "
+    # "--xla_mosaic_dump_to=/tmp/mosaic_dumps "
+    "--xla_jf_dump_to=/tmp/dump_llo/ "
     "--xla_xprof_register_llo_debug_info=true "
     "--xla_enable_custom_call_region_trace=true"
 )
@@ -42,7 +43,8 @@ CASES = {
     "grid_4V": dict(B=1, T=256, H=1, K=128, V=512, chunk_size=128),
     # grid=(1,2,2) — parallel over K and V blocks
     "grid_2K2V": dict(B=1, T=256, H=1, K=256, V=256, chunk_size=128),
-    # "real_train": dict(B=2, T=4096, H=16, K=128, V=128, chunk_size=128),
+    # grid=(16,1,1), 32 chunks — large H, many chunks
+    "real_train": dict(B=2, T=4096, H=16, K=128, V=128, chunk_size=128),
 }
 
 SCALE_FN = lambda K: K**-0.5

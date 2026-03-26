@@ -606,102 +606,97 @@ def chunk_bwd_dh_ref(
 
 
 def _chunk_bwd_dh_kernel(
-    q_ref,          # [1, T_sum, BK]
-    do_ref,         # [1, T_sum, BV]
+    q_ref,          # [1, 1, BT, BK]
+    do_ref,         # [1, 1, BT, BV]
     dht_ref,        # [N, 1, BK, BV]
-    gk_ref,         # [1, T_sum, BK]
-    g_ref,          # [1, T_sum]
+    gk_ref,         # [1, 1, BT, BK]
+    g_ref,          # [1, 1, BT]
     g_gamma,        # [H]
     cu_seqlens_ref, # [num_seq + 1]
-    chunk_to_seq,   # [T_sum // BT]
-    dh_ref,         # [NS, 1, BK, BV]
+    chunk_to_seq,   # [NT]
+    dh_ref,         # [1, 1, BK, BV]
     dh0_ref,        # [N, 1, BK, BV] or None
+    carry_ref,      # scratch VMEM (BK, BV)
     *,
     BT: int,
-    BS: int,
+    NT: int,
     scale: float,
 ):
-    T_sum, BK = q_ref.shape[1], q_ref.shape[2]
-    BV = do_ref.shape[2]
-    NT = pl.cdiv(T_sum, BT)
-    NTS = BS // BT
+    BK = q_ref.shape[3]
+    BV = do_ref.shape[3]
 
-    b_dh = jnp.zeros((BK, BV), dtype=jnp.float32)
+    i_c = pl.program_id(3)  # chunk index (0 = last chunk in time)
+    i_t = NT - 1 - i_c      # global chunk index (forward order)
+    t0 = i_t * BT            # global time offset
+
+    # Load carry from previous step, or init zeros for first step
+    b_dh = lax.cond(
+        i_c == 0,
+        lambda _: jnp.zeros((BK, BV), dtype=jnp.float32),
+        lambda _: carry_ref[...].astype(jnp.float32),
+        operand=None,
+    )
 
     if g_gamma is not None:
         head_index = pl.program_id(0)
         b_g_ramp = g_gamma[head_index] * (jnp.arange(0, BT) + 1)  # [BT]
 
-    def body(step, b_dh):
-        i_t = NT - 1 - step
-        t0 = i_t * BT
+    seq_idx = chunk_to_seq[i_t]
+    eos = cu_seqlens_ref[seq_idx + 1]
 
-        seq_idx = chunk_to_seq[i_t]
-        eos = cu_seqlens_ref[seq_idx + 1]
+    # reset dh at sequence boundary (last chunk of each sequence)
+    is_last_chunk = (t0 + BT >= eos)
 
-        # reset dh at sequence boundary (last chunk of each sequence)
-        is_last_chunk = (t0 + BT >= eos)
+    def reset_state(_):
+        if dht_ref is not None:
+            return dht_ref[seq_idx, 0].astype(jnp.float32)
+        return jnp.zeros((BK, BV), dtype=jnp.float32)
 
-        def reset_state(_):
-            if dht_ref is not None:
-                return dht_ref[seq_idx, 0].astype(jnp.float32)
-            return jnp.zeros((BK, BV), dtype=jnp.float32)
+    b_dh = lax.cond(is_last_chunk, reset_state, lambda _: b_dh, operand=None)
 
-        b_dh = lax.cond(is_last_chunk, reset_state, lambda _: b_dh, operand=None)
+    # store dh (after reset, before compute)
+    dh_ref[0, 0] = b_dh.astype(dh_ref.dtype)
 
-        # store dh at split boundary
-        i_s = i_t // NTS
+    b_q = q_ref[(0, 0, slice(None), slice(None))]    # [BT, BK]
+    b_do = do_ref[(0, 0, slice(None), slice(None))]   # [BT, BV]
+    b_q = (b_q * scale).astype(b_q.dtype)
 
-        def store_fn(_):
-            dh_ref[i_s, 0] = b_dh.astype(dh_ref.dtype)
-            return None
+    # scalar gate (g)
+    if g_ref is not None:
+        b_g_scalar = g_ref[0, 0, slice(None)]  # [BT]
+        b_g_scalar_last = b_g_scalar[BT - 1]
+        b_dh *= exp(b_g_scalar_last)
+        b_q = (b_q * exp(b_g_scalar)[:, None]).astype(b_q.dtype)
 
-        lax.cond((i_t % NTS) == 0, store_fn, lambda _: None, operand=None)
+    # per-head fixed decay (g_gamma)
+    if g_gamma is not None:
+        b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - t0)
+        b_dh *= exp(b_g_last)
+        b_q = (b_q * exp(b_g_ramp)[:, None]).astype(b_q.dtype)
 
-        b_q = q_ref[(0, pl.dslice(t0, BT), slice(None))]    # [BT, BK]
-        b_do = do_ref[(0, pl.dslice(t0, BT), slice(None))]   # [BT, BV]
-        b_q = (b_q * scale).astype(b_q.dtype)
+    # per-K-dim gate (gk)
+    if gk_ref is not None:
+        b_gk = gk_ref[(0, 0, slice(None), slice(None))]  # [BT, BK]
+        g_last = b_gk[BT - 1, :]
+        b_dh = b_dh * exp(g_last)[:, None]  # [BK, BV] * [BK, 1]
+        b_q = (b_q * exp(b_gk)).astype(b_q.dtype)
 
-        # scalar gate (g)
-        if g_ref is not None:
-            b_g_scalar = g_ref[0, pl.dslice(t0, BT)]  # [BT]
-            b_g_scalar_last = b_g_scalar[BT - 1]
-            b_dh *= exp(b_g_scalar_last)
-            b_q = (b_q * exp(b_g_scalar)[:, None]).astype(b_q.dtype)
+    b_dh = b_dh + jax.lax.dot(
+        b_q.astype(jnp.float32).T, b_do,
+        precision=lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
 
-        # per-head fixed decay (g_gamma)
-        if g_gamma is not None:
-            b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - t0)
-            b_dh *= exp(b_g_last)
-            b_q = (b_q * exp(b_g_ramp)[:, None]).astype(b_q.dtype)
+    # write dh0 at sequence start
+    bos = cu_seqlens_ref[seq_idx]
 
-        # per-K-dim gate (gk)
-        if gk_ref is not None:
-            b_gk = gk_ref[(0, pl.dslice(t0, BT), slice(None))]  # [BT, BK]
-            g_last = b_gk[BT - 1, :]
-            b_dh = b_dh * exp(g_last)[:, None]  # [BK, BV] * [BK, 1]
-            b_q = (b_q * exp(b_gk)).astype(b_q.dtype)
+    @pl.when(t0 == bos)
+    def _():
+        if dh0_ref is not None:
+            dh0_ref[seq_idx, 0] = b_dh.astype(dh0_ref.dtype)
 
-        b_dh = b_dh + jax.lax.dot(
-            b_q.astype(jnp.float32).T, b_do,
-            precision=lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        )
-
-        # write dh0 at sequence start
-        bos = cu_seqlens_ref[seq_idx]
-        is_first_chunk = (t0 == bos)
-
-        def write_dh0(_):
-            if dh0_ref is not None:
-                dh0_ref[seq_idx, 0] = b_dh.astype(dh0_ref.dtype)
-            return None
-
-        lax.cond(is_first_chunk, write_dh0, lambda _: None, operand=None)
-
-        return b_dh
-
-    lax.fori_loop(0, NT, body, b_dh)
+    # Save carry for next step
+    carry_ref[...] = b_dh.astype(jnp.float32)
 
 
 @functools.partial(
@@ -710,7 +705,6 @@ def _chunk_bwd_dh_kernel(
         "scale",
         "output_dh0",
         "chunk_size",
-        "split_size",
         "states_in_fp32",
         "interpret",
     ],
@@ -728,48 +722,46 @@ def chunk_bwd_dh_kernel(
     output_dh0: bool = False,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 128,
-    split_size: int | None = None,
     states_in_fp32: bool = False,
     interpret: bool = False,
 ):
     BK, BV, BT = 128, 128, chunk_size
-    BS = BT if split_size is None else split_size
     B, T, H, K = q.shape
     V = do.shape[-1]
     T_sum = B * T
+    NT = T_sum // BT
 
     assert K % 128 == 0, "K % 128 must equal to 0."
     assert V % 128 == 0, "V % 128 must equal to 0."
     assert T % chunk_size == 0, "T mod chunk_size must equal to 0."
-    assert BS % BT == 0, (
-        f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
-    )
 
     if cu_seqlens_dev is None:
         cu_seqlens_dev = jnp.arange(T_sum + 1, step=T)
     chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens_dev, T_sum=T_sum, BT=BT)
-    N, NS = len(cu_seqlens_dev) - 1, T_sum // BS
+    N = len(cu_seqlens_dev) - 1
 
-    q = jnp.reshape(q, (T_sum, H, K)).transpose(1, 0, 2)   # [H, T_sum, K]
-    do = jnp.reshape(do, (T_sum, H, V)).transpose(1, 0, 2)  # [H, T_sum, V]
+    # Reshape to (H, NT, BT, X) — one chunk per grid step
+    q = jnp.reshape(q, (T_sum, H, K)).transpose(1, 0, 2).reshape(H, NT, BT, K)
+    do = jnp.reshape(do, (T_sum, H, V)).transpose(1, 0, 2).reshape(H, NT, BT, V)
     if gk is not None:
-        gk = jnp.reshape(gk, (T_sum, H, K)).transpose(1, 0, 2)
+        gk = jnp.reshape(gk, (T_sum, H, K)).transpose(1, 0, 2).reshape(H, NT, BT, K)
     if g is not None:
-        g = jnp.reshape(g, (T_sum, H)).transpose(1, 0)  # (H, T_sum)
+        g = jnp.reshape(g, (T_sum, H)).transpose(1, 0).reshape(H, NT, BT)
 
-    grid = (H, pl.cdiv(K, BK), pl.cdiv(V, BV))
+    grid = (H, pl.cdiv(K, BK), pl.cdiv(V, BV), NT)
 
-    def idx_map_K(h, k, v): return h, 0, k
-    def idx_map_V(h, k, v): return h, 0, v
-    def idx_map_state(h, k, v): return 0, h, k, v
+    # Reversed chunk order: c=0 → last chunk (processed first in backward)
+    def idx_map_K(h, k, v, c): return h, NT - 1 - c, 0, k
+    def idx_map_V(h, k, v, c): return h, NT - 1 - c, 0, v
+    def idx_map_state(h, k, v, c): return 0, h, k, v
 
     dtype_out = q.dtype if not states_in_fp32 else jnp.float32
 
     out_shape = [
-        jax.ShapeDtypeStruct(shape=(NS, H, K, V), dtype=dtype_out),
+        jax.ShapeDtypeStruct(shape=(NT, H, K, V), dtype=dtype_out),
     ]
     out_specs = [
-        pl.BlockSpec((NS, 1, BK, BV), idx_map_state),
+        pl.BlockSpec((1, 1, BK, BV), lambda h, k, v, c: (NT - 1 - c, h, k, v)),
     ]
     if output_dh0:
         out_shape.append(jax.ShapeDtypeStruct(shape=(N, H, K, V), dtype=dtype_out))
@@ -779,17 +771,17 @@ def chunk_bwd_dh_kernel(
         out_specs.append(None)
 
     in_specs = [
-        pl.BlockSpec((1, T_sum, BK), idx_map_K),   # q
-        pl.BlockSpec((1, T_sum, BV), idx_map_V),    # do
+        pl.BlockSpec((1, 1, BT, BK), idx_map_K),   # q
+        pl.BlockSpec((1, 1, BT, BV), idx_map_V),    # do
         pl.BlockSpec((N, 1, BK, BV), idx_map_state) if dht is not None else None,  # dht
-        pl.BlockSpec((1, T_sum, BK), idx_map_K) if gk is not None else None,  # gk
-        pl.BlockSpec((1, T_sum), lambda h, _, __: (h, 0)) if g is not None else None,  # g
+        pl.BlockSpec((1, 1, BT, BK), idx_map_K) if gk is not None else None,  # gk
+        pl.BlockSpec((1, 1, BT), lambda h, k, v, c: (h, NT - 1 - c, 0)) if g is not None else None,  # g
         pl.BlockSpec(memory_space=pltpu.SMEM) if g_gamma is not None else None,  # g_gamma
         pl.BlockSpec(memory_space=pltpu.SMEM),      # cu_seqlens
         pl.BlockSpec(memory_space=pltpu.SMEM),      # chunk_to_seq
     ]
 
-    kernel = functools.partial(_chunk_bwd_dh_kernel, BT=BT, BS=BS, scale=scale)
+    kernel = functools.partial(_chunk_bwd_dh_kernel, BT=BT, NT=NT, scale=scale)
 
     dh_all, dh0 = pl.pallas_call(
         kernel,
@@ -798,12 +790,13 @@ def chunk_bwd_dh_kernel(
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
+            scratch_shapes=[pltpu.VMEM((BK, BV), jnp.float32)],
         ),
         out_shape=out_shape,
         interpret=interpret,
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "parallel"),
-            # vmem_limit_bytes=32 * 1024 * 1024,
+            dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"),
+            vmem_limit_bytes=32 * 1024 * 1024,
         ),
     )(q, do, dht, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
 

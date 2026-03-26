@@ -149,7 +149,7 @@ def _chunk_simple_gla_fwd_ref(
     pos = jnp.tile(pos, T_pad // C).reshape(1, T_pad, 1, 1)
     g_cumsum = jnp.broadcast_to(g_gamma * pos, q.shape)
 
-    h, ht = chunk_fwd_h_ref(
+    h, ht = chunk_fwd_h(
         k, v, gk=g_cumsum, h0=initial_state,
         output_final_state=output_final_state, chunk_size=C,
     )
@@ -620,12 +620,9 @@ def chunk_simple_gla_bwd(
         cu_seqlens_dev=cu_seqlens_dev,
     )
 
-    # 3. Compute A via existing intra-chunk attention with synthetic gk
-    A = chunk_gla_fwd_intra_gk_ref(q, k, gk, scale, chunk_size=C,cu_seqlens_dev=cu_seqlens_dev)
-
     # 4. Fused dq/dk/dv via simple GLA pallas kernel
     dq, dk, dv = chunk_simple_gla_bwd_o_pl(
-        q, k, v, g_gamma, h, A, do, dh,
+        q, k, v, g_gamma, h, do, dh,
         scale=scale, chunk_size=C,
         cu_seqlens_dev=cu_seqlens_dev,
     )
