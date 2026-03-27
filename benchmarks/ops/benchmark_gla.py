@@ -201,8 +201,9 @@ def _run_provider(
         @jax.jit
         def run_bwd():
             return chunk_simple_gla_bwd(
-                q, k, v, g_gamma, scale=scale,
-                initial_state=None, do=do, dht=None,
+                q, k, v, do,
+                g_gamma=g_gamma, scale=scale,
+                h0=None, dht=None,
                 chunk_size=chunk_size,
             )
 
