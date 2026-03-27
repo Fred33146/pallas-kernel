@@ -53,14 +53,40 @@ The current package-level dependency tree (ordered bottom-up):
 ## 3. Testing & Validation Boundaries
 
 *   Validation is also subject to strict layer divisions and physical isolation. **Modifications at a specific layer must be verified by tests corresponding to that same layer.**
+
+### 3.1 Reference Implementations & Tests
+
+*   **`tops/cpu/`** is the sole location for canonical reference implementations (Gold/Reference). All reference implementations are written in pure JAX, executed on CPU, and serve as the standard answers (Goldens). The directory is organized by operator domain:
+
+    ```
+    tops/cpu/
+    └── ops/
+        ├── common/      # Shared chunk utility reference implementations
+        ├── gla/          # GLA operator reference implementations
+        ├── simple_gla/   # Simple GLA operator reference implementations
+        └── mla/          # MLA operator reference implementations
+    ```
+
+*   **`tests/ref/`** is the unified location for reference comparison tests, mirroring the directory structure of `tops/cpu/ops/`. These tests compare `tops/cpu/` reference implementations against other known-correct implementations (e.g., PyTorch CPU/GPU) to continuously validate the correctness of the reference implementations themselves:
+
+    ```
+    tests/ref/
+    ├── common/       # Reference tests for shared utilities
+    ├── gla/          # Reference tests for GLA implementations
+    ├── simple_gla/   # Reference tests for Simple GLA implementations
+    └── mla/          # Reference tests for MLA implementations
+    ```
+
+*   **Alignment requirement**: All new Pallas/JAX implementations added to `tops/ops/` must align with `tops/cpu/` and pass reference comparison tests.
+*   **How reference correctness is established**: The correctness of `tops/cpu/` must be continuously validated through tests in `tests/ref/` against `torch_gpu/torch_cpu` comparisons, so it remains a trustworthy baseline.
+
+### 3.2 Operator & Layer Tests
+
 *   Test types within the `tests/` directory are strictly restricted to the following two types of reference comparisons:
-    1.  **CPU Reference Tests (vs JAX-CPU)**: Output and gradients from Pallas kernels are checked for tolerance against reference implementations written in pure `jax.numpy`. All these pure-CPU reference primitives must be centralized under **`tops/cpu/`** and its corresponding layered subdirectories as the standard answers (Goldens).
+    1.  **CPU Reference Tests (vs JAX-CPU)**: Output and gradients from Pallas kernels are checked for tolerance against reference implementations in `tops/cpu/` written in pure JAX.
     2.  **GPU Reference Tests (vs Torch-GPU/Triton)**: Aligning the computation results of Pallas kernels against known-correct, cross-framework computation libraries (such as those based on PyTorch or existing high-priority components like FlashAttention) under identical hardware conditions.
 *   **`tests/ops/`**: Modifications to low-level operators (e.g., scheduling optimizations of Pallas kernels) must use the two comparison test categories above to verify results or gradient tolerances. It is strictly prohibited to overstep and rely on high-level tests (such as `test_gla.py` in the layers tier) as a workaround for validation.
 *   **`tests/modules/` & `tests/layers/`**: Modifications at the network component or layer levels must include corresponding integration encapsulation and data flow validation tests.
-
-*   **`tops/cpu/` is the default Gold/Reference**: Implementations under `tops/cpu/` are treated as canonical reference implementations. Any new Pallas/JAX implementation added under `tops/ops/` must, by default, align against `tops/cpu/` through reference-comparison tests.
-*   **How reference correctness is established**: The correctness of `tops/cpu/` must be continuously validated against `torch_gpu/torch_cpu` comparisons, so it remains a trustworthy baseline.
 *   **Default comparator and GPU-specific exception**: The default comparator is `tops/cpu/`. If GPU-based comparison is required (e.g., Torch/Triton), create a separate test file and append the `_gpu` suffix to its filename.
 
 ---
