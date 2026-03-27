@@ -14,6 +14,9 @@ from tops.ops.utils import is_tpu_runtime
 from tops.utils import assert_shape, assert_shape_or_none, export_public, pad_to_multiple
 
 
+# chunk_simple_gla kernels require K and V to be multiples of this.
+_KV_ALIGN = 128
+
 # =============================================================================
 # Reference implementations (pure JAX, no Pallas)
 # =============================================================================
@@ -628,5 +631,158 @@ def chunk_simple_gla_bwd(
     )
 
     return dq, dk, dv, dh0
+
+def _pad_axis(x: jnp.ndarray, multiple: int, axis: int) -> jnp.ndarray:
+    """Zero-pad tensor along *axis* so its size is a multiple of *multiple*."""
+    rem = x.shape[axis] % multiple
+    if rem == 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, multiple - rem)
+    return jnp.pad(x, pad_width)
+
+
+def _pad_inputs(q, k, v, h0, chunk_size):
+    """Pad T (axis 1) to chunk_size, K and V (axis -1) to _KV_ALIGN."""
+    q = _pad_axis(_pad_axis(q, chunk_size, 1), _KV_ALIGN, -1)
+    k = _pad_axis(_pad_axis(k, chunk_size, 1), _KV_ALIGN, -1)
+    v = _pad_axis(_pad_axis(v, chunk_size, 1), _KV_ALIGN, -1)
+    if h0 is not None:
+        # h0: [B, H, K, V]
+        h0 = _pad_axis(_pad_axis(h0, _KV_ALIGN, -2), _KV_ALIGN, -1)
+    return q, k, v, h0
+
+
+
+def _pallas_chunk_gla_fwd(
+    q, k, v, g_gamma, initial_state,
+    scale, output_final_state, chunk_size,
+):
+    """Forward rule: run chunk_simple_gla_fwd and save inputs as residuals."""
+    dtype = q.dtype
+    T_orig, K_orig, V_orig = q.shape[1], q.shape[-1], v.shape[-1]
+    q_f32, k_f32, v_f32 = (x.astype(jnp.float32) for x in (q, k, v))
+    g_gamma_f32 = g_gamma.astype(jnp.float32)
+    h0_f32 = initial_state.astype(jnp.float32) if initial_state is not None else None
+    s = _resolve_scale(scale, K_orig)
+
+    q_f32, k_f32, v_f32, h0_f32 = _pad_inputs(q_f32, k_f32, v_f32, h0_f32, chunk_size)
+
+    o, ht = chunk_simple_gla_fwd(
+        q_f32, k_f32, v_f32,
+        g_gamma=g_gamma_f32, scale=s, h0=h0_f32,
+        use_ht=output_final_state,
+        chunk_size=chunk_size,
+    )
+    o_out = o[:, :T_orig, :, :V_orig]
+    ht_out = ht[:, :, :K_orig, :V_orig] if ht is not None else None
+    primals_out = (o_out.astype(dtype), ht_out if output_final_state else None)
+    # Save padded inputs for backward.
+    residuals = (q_f32, k_f32, v_f32, g_gamma_f32, h0_f32, T_orig, K_orig, V_orig)
+    return primals_out, residuals
+
+
+
+def _resolve_scale(scale: float | None, K: int) -> float:
+    return scale if scale is not None else K**-0.5
+
+def _pallas_chunk_gla_bwd(
+    scale, output_final_state, chunk_size,
+    residuals, grad_outputs,
+):
+    """Backward rule: call chunk_simple_gla_bwd to compute gradients."""
+    q_f32, k_f32, v_f32, g_gamma_f32, h0_f32, T_orig, K_orig, V_orig = residuals
+    do, dht = grad_outputs
+
+    qkv_dtype = do.dtype
+    s = _resolve_scale(scale, K_orig)
+
+    # Pad do to match the padded T/V used in forward.
+    do = do.astype(jnp.float32)
+    do = _pad_axis(do, chunk_size, 1)
+    do = _pad_axis(do, _KV_ALIGN, -1)
+    if dht is not None:
+        dht = dht.astype(jnp.float32)
+        dht = _pad_axis(dht, _KV_ALIGN, -2)  # K
+        dht = _pad_axis(dht, _KV_ALIGN, -1)  # V
+
+    dq, dk, dv, dh0 = chunk_simple_gla_bwd(
+        q_f32, k_f32, v_f32, do,
+        g_gamma=g_gamma_f32,
+        scale=s, h0=h0_f32,
+        dht=dht,
+        chunk_size=chunk_size,
+    )
+    # Slice gradients back to original dimensions.
+    dq = dq[:, :T_orig, :, :K_orig]
+    dk = dk[:, :T_orig, :, :K_orig]
+    dv = dv[:, :T_orig, :, :V_orig]
+    # chunk_simple_gla_bwd does not return dg because g_gamma is treated
+    # as a fixed per-head hyperparameter.  Produce a zero gradient so the
+    # custom_vjp pytree matches (q, k, v, g_gamma, initial_state).
+    dg = jnp.zeros_like(g_gamma_f32)
+    if h0_f32 is None:
+        dh0 = None
+    else:
+        dh0 = dh0[:, :, :K_orig, :V_orig]
+    dq = dq.astype(qkv_dtype)
+    dk = dk.astype(qkv_dtype)
+    dv = dv.astype(qkv_dtype)
+    if dh0 is not None:
+        dh0 = dh0.astype(qkv_dtype)
+    return dq, dk, dv, dg, dh0
+
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
+def chunk_simple_gla(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    g_gamma: jnp.ndarray,
+    initial_state: jnp.ndarray | None = None,
+    scale: float | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    """Chunked Simple GLA using pallas-kernel's Pallas TPU kernels.
+
+    Args:
+        q: [B, T, H, K] queries
+        k: [B, T, H, K] keys
+        v: [B, T, H, V] values
+        g_gamma: constant log-space gate, shape (H,).
+            Typically (H,) for per-head ALiBi-style
+            slopes; squeezed to (H,) internally.
+        initial_state: optional [B, H, K, V] initial recurrent state
+        scale: attention scale (default 1/sqrt(K))
+        output_final_state: whether to return the final state
+        chunk_size: chunk size BT
+
+    Returns:
+        (o, final_state) where o is [B, T, H, V] and final_state is
+        [B, H, K, V] or None.
+    """
+    dtype = q.dtype
+    T_orig, K_orig, V_orig = q.shape[1], q.shape[-1], v.shape[-1]
+    q_f32, k_f32, v_f32 = (x.astype(jnp.float32) for x in (q, k, v))
+    g_gamma_f32 = g_gamma.astype(jnp.float32)
+    h0_f32 = initial_state.astype(jnp.float32) if initial_state is not None else None
+    s = _resolve_scale(scale, K_orig)
+
+    q_f32, k_f32, v_f32, h0_f32 = _pad_inputs(q_f32, k_f32, v_f32, h0_f32, chunk_size)
+
+    o, ht = chunk_simple_gla_fwd(
+        q_f32, k_f32, v_f32,
+        g_gamma=g_gamma_f32, scale=s, h0=h0_f32,
+        use_ht=output_final_state,
+        chunk_size=chunk_size,
+    )
+    o = o[:, :T_orig, :, :V_orig]
+    if ht is not None:
+        ht = ht[:, :, :K_orig, :V_orig]
+    return o.astype(dtype), (ht if output_final_state else None)
+
+chunk_simple_gla.defvjp(_pallas_chunk_gla_fwd, _pallas_chunk_gla_bwd)
 
 __all__ = export_public(globals())

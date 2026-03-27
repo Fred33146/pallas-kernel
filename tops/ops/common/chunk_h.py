@@ -504,6 +504,89 @@ def chunk_fwd_h_ref(
         return h_all, None
 
 
+def _chunk_bwd_dh_scan(q, do, g, g_gamma, gk, dht,
+                       scale, output_dh0, states_in_fp32,
+                       C, B, T, H, K, V, NT):
+    """lax.scan-based backward state gradient propagation for fixed-length sequences.
+
+    Mirrors _chunk_fwd_h_scan: replaces the Python for-loop in chunk_bwd_dh_ref
+    to avoid XLA trace-time loop unrolling (which creates a huge HLO graph).
+    """
+    has_g = g is not None
+    has_gk = gk is not None
+
+    # Reshape into chunks: [B, NT, C, H, D] then [NT, B, C, H, D] for scan
+    q_scan = q.reshape(B, NT, C, H, K).transpose(1, 0, 2, 3, 4)
+    do_scan = do.reshape(B, NT, C, H, V).transpose(1, 0, 2, 3, 4)
+
+    scan_inputs = (q_scan, do_scan)
+    if has_g:
+        g_scan = g.reshape(B, NT, C, H).transpose(1, 0, 2, 3)
+        scan_inputs += (g_scan,)
+    if has_gk:
+        gk_scan = gk.reshape(B, NT, C, H, K).transpose(1, 0, 2, 3, 4)
+        scan_inputs += (gk_scan,)
+
+    # Precompute g_gamma decay terms (constant across chunks)
+    if g_gamma is not None:
+        g_gamma_f32 = g_gamma.astype(jnp.float32)
+        g_last_gamma = g_gamma_f32 * C  # [H]
+        state_decay = jnp.exp(g_last_gamma)  # [H]
+        b_g_ramp = g_gamma_f32[None, :] * (jnp.arange(C, dtype=jnp.float32) + 1)[:, None]  # [C, H]
+
+    def scan_fn(dh, chunk_data):
+        # Unpack scan inputs (structure determined at trace time)
+        idx = 0
+        b_q = chunk_data[idx]; idx += 1
+        b_do = chunk_data[idx]; idx += 1
+        if has_g:
+            b_g_scalar = chunk_data[idx]; idx += 1
+        if has_gk:
+            b_gk = chunk_data[idx]
+
+        dh_out = dh  # state BEFORE update (stored at this chunk boundary)
+
+        # Per-K-dim gate gk: [B, C, H, K]
+        if has_gk:
+            b_gk_last = b_gk[:, -1, :, :]  # [B, H, K]
+            dh = dh * jnp.exp(b_gk_last.astype(jnp.float32))[:, :, :, None]
+            b_q_hat = b_q * jnp.exp(b_gk.astype(jnp.float32)) * scale
+        elif has_g:
+            b_g_last = b_g_scalar[:, -1, :]  # [B, H]
+            dh = dh * jnp.exp(b_g_last.astype(jnp.float32))[:, :, None, None]
+            b_q_hat = (b_q * jnp.exp(b_g_scalar.astype(jnp.float32))[:, :, :, None] * scale)
+        elif g_gamma is not None:
+            dh = dh * state_decay[None, :, None, None]
+            b_q_hat = (b_q * jnp.exp(b_g_ramp)[None, :, :, None] * scale)
+        else:
+            b_q_hat = b_q * scale
+
+        # Accumulate: dh += q_hat^T @ do  (contract C, batch B and H)
+        dh = dh + lax.dot_general(
+            b_q_hat.astype(jnp.float32),
+            b_do.astype(jnp.float32),
+            dimension_numbers=(((1,), (1,)), ((0, 2), (0, 2))),
+            precision=lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        return dh, dh_out
+
+    # Initial state: [B, H, K, V]
+    dh_init = jnp.zeros((B, H, K, V), dtype=jnp.float32)
+    if dht is not None:
+        dh_init = dht.reshape(B, H, K, V).astype(jnp.float32)
+
+    dh_final, dh_all = lax.scan(scan_fn, dh_init, scan_inputs, reverse=True)
+    # dh_all: [NT, B, H, K, V] -> [B, NT, H, K, V]
+    dh_all = dh_all.transpose(1, 0, 2, 3, 4)
+
+    dh0 = None
+    if output_dh0:
+        dh0 = dh_final.astype(jnp.float32)  # [B, H, K, V]
+
+    return dh_all, dh0
+
+
 def chunk_bwd_dh_ref(
     q: jax.Array,
     k: jax.Array,
@@ -548,6 +631,15 @@ def chunk_bwd_dh_ref(
     NT = T // C
     N = B if cu_seqlens_cpu is None else cu_seqlens_cpu.shape[-1] - 1
     assert T % C == 0, "T must be a multiple of chunk_size for chunk_bwd_dh"
+
+    # Fast path: fixed-length sequences use lax.scan (avoids XLA loop unrolling)
+    if cu_seqlens_cpu is None:
+        return _chunk_bwd_dh_scan(
+            q, do, g, g_gamma, gk, dht,
+            scale, output_dh0, states_in_fp32,
+            C, B, T, H, K, V, NT,
+        )
+
     is_varlen = cu_seqlens_cpu is not None
 
     q = q.reshape(-1, H, K)
