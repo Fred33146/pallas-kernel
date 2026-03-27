@@ -23,6 +23,12 @@ import pytest
 from tops.cpu.ops.gla import chunk_gla
 from tests.utils import compare_tensor
 
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    pass
+
 HAS_CUDA = False
 try:
     import torch
@@ -66,7 +72,7 @@ _VARLEN_SHAPES = [
 _DTYPE_TOLS = {
     "float64":  dict(atol=5e-5, rtol=5e-5),
     "float32":  dict(atol=5e-5, rtol=5e-5),
-    "float16":  dict(atol=2e-2, rtol=2e-2),
+    "float16":  dict(atol=5e-3, rtol=5e-3),
     "bfloat16": dict(atol=5e-2, rtol=5e-2),
 }
 
@@ -145,7 +151,7 @@ def test_gla_varlen_fwd(cfg):
     q = jax.random.normal(keys[0], (1, T, H, K))
     k = jax.random.normal(keys[1], (1, T, H, K))
     v = jax.random.normal(keys[2], (1, T, H, V))
-    g = jax.random.normal(keys[3], (1, T, H, K)) * 0.1
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (1, T, H, K))).astype(q.dtype)
 
     o_var, _ = chunk_gla(q, k, v, g=g, cu_seqlens=cu, chunk_size=C)
     o_ind, _ = _run_independent_batch(q, k, v, g, cu, C)
@@ -161,7 +167,7 @@ def test_gla_varlen_fwd_with_h0():
     q = jax.random.normal(keys[0], (1, 32, H, K))
     k = jax.random.normal(keys[1], (1, 32, H, K))
     v = jax.random.normal(keys[2], (1, 32, H, V))
-    g = jax.random.normal(keys[3], (1, 32, H, K)) * 0.1
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (1, 32, H, K))).astype(q.dtype)
     h0 = jax.random.normal(keys[4], (2, H, K, V))
 
     o_var, ht_var = chunk_gla(
@@ -184,7 +190,7 @@ def test_gla_varlen_fp64():
     q = jax.random.normal(keys[0], (1, 30, H, K), dtype=jnp.float64)
     k = jax.random.normal(keys[1], (1, 30, H, K), dtype=jnp.float64)
     v = jax.random.normal(keys[2], (1, 30, H, V), dtype=jnp.float64)
-    g = jax.random.normal(keys[3], (1, 30, H, K), dtype=jnp.float64) * 0.1
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (1, 30, H, K), dtype=jnp.float64))
 
     o_var, _ = chunk_gla(q, k, v, g=g, cu_seqlens=cu, chunk_size=C)
     o_ind, _ = _run_independent_batch(q, k, v, g, cu, C)
@@ -212,7 +218,7 @@ def test_gla_varlen_cpu_vs_triton(cfg):
     q_t = torch.randn(1, T, H, K, dtype=torch_dtype)
     k_t = torch.randn(1, T, H, K, dtype=torch_dtype)
     v_t = torch.randn(1, T, H, V, dtype=torch_dtype)
-    g_t = torch.randn(1, T, H, K, dtype=torch_dtype) * 0.1
+    g_t = F.logsigmoid(torch.randn(1, T, H, K)).to(torch_dtype)
 
     cu_t = torch.tensor(cu_list, dtype=torch.long)
 
@@ -260,7 +266,7 @@ def test_gla_varlen_cpu_vs_triton_with_h0():
     q_t = torch.randn(1, T, H, K, dtype=torch.float32)
     k_t = torch.randn(1, T, H, K, dtype=torch.float32)
     v_t = torch.randn(1, T, H, V, dtype=torch.float32)
-    g_t = torch.randn(1, T, H, K, dtype=torch.float32) * 0.1
+    g_t = F.logsigmoid(torch.randn(1, T, H, K)).to(torch.float32)
     h0_t = torch.randn(N, H, K, V, dtype=torch.float32)
     cu_t = torch.tensor(cu_list, dtype=torch.long)
 

@@ -184,12 +184,11 @@ def chunk_fwd_h(
 
         h = h + dot("bchk,bchv->bhkv", b_k, b_v, acc)
 
-        # Simulate FLA Triton SMEM round-trip: h is stored in k.dtype between chunks
-        # when states_in_fp32=False (fp16/bf16). Without this, the CPU ref keeps h in
-        # fp32 while Triton quantizes at each chunk boundary, causing systematic drift
-        # that grows with sequence length.
-        if store_dtype != acc:
-            h = h.astype(store_dtype).astype(acc)
+        # NOTE: FLA Triton keeps b_h in fp32 registers throughout the loop.
+        # tl.store(p_h, b_h.to(p_h.dtype)) is write-only to HBM — the
+        # accumulator is never read back, so no round-trip quantization occurs.
+        # The h_list entries (for chunk_fwd_o) are already cast to store_dtype
+        # above, matching FLA's HBM stores.
 
         # --- Varlen: store ht at last chunk of each sequence ---
         if is_varlen and output_final_state:
