@@ -1,3 +1,4 @@
 from .chunk import chunk_simple_gla_bwd as chunk_simple_gla_bwd
 from .chunk import chunk_simple_gla_fwd as chunk_simple_gla_fwd
+from .fused_recurrent import fused_recurrent_simple_gla as fused_recurrent_simple_gla
 from .naive import simple_gla_naive as simple_gla_naive
