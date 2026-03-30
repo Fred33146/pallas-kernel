@@ -261,8 +261,10 @@ def chunk_bwd_dqkwg(
           "bjhi,bihk->bjhk", jnp.transpose(b_ds, (0, 3, 2, 1)).astype(q.dtype), b_q, acc
         )
 
+        # Place dg_last at last VALID position (not C-1) so _write_chunk
+        # captures it. Matches Triton: o_t < min(i_t*BT+BT, T) - 1.
         last_mask = jnp.zeros((C,), dtype=acc)
-        last_mask = last_mask.at[-1].set(1.0)
+        last_mask = last_mask.at[valid_len - 1].set(1.0)
         b_dg = b_dg + b_dg_last[:, None, :] * last_mask[None, :, None]
 
         dg_buf = _write_chunk(dg_buf, b_dg, start, valid_len)
@@ -318,9 +320,6 @@ def chunk_bwd_dqkwg(
   do_c = do.reshape(B, NT, C, H, V)
   if g is not None:
     g_c = g.reshape(B, NT, C, H)
-
-  # Causal mask [C, C]: lower-triangular (i >= j)
-  causal_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
 
   dq_chunks = []
   dk_chunks = []
