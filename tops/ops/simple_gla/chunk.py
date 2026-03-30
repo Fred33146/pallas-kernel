@@ -628,6 +628,7 @@ def chunk_simple_gla_bwd(
         q, k, v, g_gamma, h, do, dh,
         scale=scale, chunk_size=C,
         cu_seqlens_dev=cu_seqlens_dev,
+        interpret=interpret,
     )
 
     return dq, dk, dv, dh0

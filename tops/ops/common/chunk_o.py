@@ -15,8 +15,134 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-from tops.ops.utils import exp
+from tops.ops.utils import exp, is_tpu_runtime
 from tops.utils import assert_shape, assert_shape_or_none
+
+
+def _chunk_fwd_o_kernel(
+    q_ref,
+    k_ref,
+    v_ref,
+    h_ref,
+    g_ref,
+    g_gamma_ref,
+    scale_ref,
+    o_ref,
+    *,
+    BT: int,
+):
+    """Pallas kernel for chunk_fwd_o.
+
+    Grid: (H, total_NT, num_v_tiles)
+    Refs (after block spec indexing):
+      q_ref/k_ref: (1, 1, BT, K)
+      v_ref: (1, 1, BT, BV)
+      h_ref: (1, 1, K, BV)
+      g_ref: (1, 1, BT) or None
+      g_gamma_ref: [H] via SMEM or ANY
+      scale_ref: (1,) via SMEM or ANY
+      o_ref: (1, 1, BT, BV)
+    """
+    b_q = q_ref[0, 0]  # (BT, K)
+    b_k = k_ref[0, 0]  # (BT, K)
+    b_v = v_ref[0, 0]  # (BT, BV)
+    b_h = h_ref[0, 0]  # (K, BV)
+
+    b_o = jnp.dot(
+        b_q,
+        b_h,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    b_A = jnp.dot(
+        b_q,
+        b_k.T,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+
+    if g_ref is not None:
+        b_g = g_ref[0, 0].astype(jnp.float32)  # (BT,)
+        b_o = b_o * exp(b_g)[:, None]
+        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+
+    if g_gamma_ref is not None:
+        head_idx = pl.program_id(0)
+        b_gamma = g_gamma_ref[head_idx].astype(jnp.float32)
+        b_g_gamma = b_gamma * (jnp.arange(BT) + 1).astype(jnp.float32)
+        b_o = b_o * exp(b_g_gamma)[:, None]
+        b_A = b_A * exp(b_g_gamma[:, None] - b_g_gamma[None, :])
+
+    mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+    b_A = jnp.where(mask, b_A, 0.0)
+    scale = scale_ref[0].astype(jnp.float32)
+
+    b_o = (b_o + jnp.dot(
+        b_A.astype(b_v.dtype),
+        b_v,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )) * scale
+    o_ref[0, 0] = b_o.astype(o_ref.dtype)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("chunk_size", "interpret"),
+)
+def _chunk_fwd_o_pl(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    h: jax.Array,
+    *,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    scale: float,
+    chunk_size: int = 64,
+    interpret: bool = False,
+) -> jax.Array:
+    """Pallas launcher for chunk_fwd_o on the uniform-length path."""
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    NT = T // BT
+    total_NT = B * NT
+
+    def _reshape_bt(x, D):
+        return x.reshape(B, NT, BT, H, D).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, D)
+
+    _q = _reshape_bt(q, K)
+    _k = _reshape_bt(k, K)
+    _v = _reshape_bt(v, V)
+    _h = h.reshape(B, NT, H, K, V).transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
+    _g = None
+    if g is not None:
+        _g = g.reshape(B, NT, BT, H).transpose(3, 0, 1, 2).reshape(H, total_NT, BT)
+
+    BV = 128 if V % 128 == 0 else V
+    num_v_tiles = V // BV
+    grid = (H, total_NT, num_v_tiles)
+
+    spec_qk = pl.BlockSpec((1, 1, BT, K), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, 0))
+    spec_v = pl.BlockSpec((1, 1, BT, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV))
+    spec_h = pl.BlockSpec((1, 1, K, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV))
+    spec_g = None if _g is None else pl.BlockSpec((1, 1, BT), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0))
+    spec_gamma = None if g_gamma is None else pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
+    spec_scale = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
+
+    o = pl.pallas_call(
+        functools.partial(_chunk_fwd_o_kernel, BT=BT),
+        grid=grid,
+        out_shape=jax.ShapeDtypeStruct((H, total_NT, BT, V), v.dtype),
+        in_specs=[spec_qk, spec_qk, spec_v, spec_h, spec_g, spec_gamma, spec_scale],
+        out_specs=pl.BlockSpec((1, 1, BT, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV)),
+        compiler_params=pltpu.CompilerParams(),
+        interpret=interpret,
+    )(_q, _k, _v, _h, _g, g_gamma, jnp.asarray(scale, dtype=jnp.float32).reshape(1))
+
+    o = o.reshape(H, B, NT, BT, V).transpose(1, 2, 3, 0, 4)
+    return o.reshape(B, T, H, V)
 
 def chunk_simple_gla_bwd_kernel(
     q_ref, k_ref, v_ref, g_gamma_ref, h_ref, do_ref, dh_ref,
@@ -63,7 +189,7 @@ def chunk_simple_gla_bwd_kernel(
 
     # 1. dA = do @ v^T * scale, masked lower-triangular
     b_A_do = b_do.astype(b_v.dtype)
-    b_dA = jnp.dot(b_A_do, b_v.T, 
+    b_dA = jnp.dot(b_A_do, b_v.T,
                    precision=jax.lax.Precision.HIGHEST,
                     preferred_element_type=jnp.float32) * scale
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
@@ -178,7 +304,7 @@ def chunk_simple_gla_bwd_o_pl(
 
     return dq, dk, dv
 
-def chunk_fwd_o(
+def chunk_fwd_o_ref(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -232,12 +358,12 @@ def chunk_fwd_o(
     # Inter-chunk: Q_c @ H_c -> [B, NT, H, C, V]
     o_inter = jnp.zeros((B, NT, H, C, V), dtype=jnp.float32)
     A = jnp.zeros((B, NT, H, C, C), dtype=jnp.float32)
-    o_inter += jnp.matmul(q_c, h, 
+    o_inter += jnp.matmul(q_c, h,
     precision=jax.lax.Precision.HIGHEST,
     preferred_element_type=jnp.float32)
 
     # Intra-chunk: Q_c @ K_c^T -> [B, NT, H, C, C]
-    A += jnp.matmul(q_c, jnp.swapaxes(k_c, -2, -1), 
+    A += jnp.matmul(q_c, jnp.swapaxes(k_c, -2, -1),
     precision=jax.lax.Precision.HIGHEST,
     preferred_element_type=jnp.float32)
 
@@ -259,7 +385,7 @@ def chunk_fwd_o(
     A = jnp.where(causal_mask, A, 0.0)
 
     # Intra: A @ V_c -> [B, NT, H, C, V]
-    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c, 
+    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c,
     precision=jax.lax.Precision.HIGHEST,
     preferred_element_type=jnp.float32)
 
@@ -269,6 +395,59 @@ def chunk_fwd_o(
     # [B, NT, H, C, V] -> [B, NT, C, H, V] -> [B, T, H, V]
     o = o.transpose(0, 1, 3, 2, 4).reshape(B, T, H, V)
     return o.astype(v.dtype)  # Cast back to input dtype
+
+
+def chunk_fwd_o(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    h: jax.Array,
+    *,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    scale: float | None = None,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
+    chunk_size: int = 64,
+    interpret: bool = False,
+) -> jax.Array:
+    """Chunk forward output computation.
+
+    Uses the Pallas kernel for both equal-length and packed varlen inputs.
+    For the varlen path we rely on the existing contract that every segment
+    length is chunk-aligned, so packed inputs can be processed as a plain
+    concatenation of full chunks.
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = chunk_size
+
+    if scale is None:
+        scale = K ** -0.5
+
+    assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+    assert T % C == 0, f"Sequence length T={T} must be divisible by chunk_size={C}"
+    assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all(), "All sequence lengths must be divisible by chunk_size"
+    assert cu_seqlens_dev is None or (cu_seqlens_dev % chunk_size == 0).all(), "All device sequence lengths must be divisible by chunk_size"
+    if cu_seqlens_cpu is not None or cu_seqlens_dev is not None:
+        assert B == 1, f"Packed varlen chunk_fwd_o expects B=1, got B={B}"
+    assert scale is not None
+
+    return _chunk_fwd_o_pl(
+        q=q,
+        k=k,
+        v=v,
+        h=h,
+        g=g,
+        g_gamma=g_gamma,
+        scale=scale,
+        chunk_size=chunk_size,
+        interpret=interpret or (not is_tpu_runtime()),
+    )
 
 
 def chunk_bwd_dv(
