@@ -139,6 +139,53 @@ def scatter_chunks(
     return result_padded[:, :T_total]
 
 
+def read_chunk(
+    tensor: jnp.ndarray,
+    start: int,
+    valid_len: int,
+    chunk_size: int,
+) -> jnp.ndarray:
+    """Read a single chunk from a packed tensor, zero-padding past valid_len.
+
+    Args:
+        tensor: [1, T, ...] packed tensor.
+        start: token-level start position along axis 1.
+        valid_len: number of valid tokens to read (may be < chunk_size for
+            the last chunk of a segment).
+        chunk_size: target chunk length C.
+
+    Returns:
+        [1, C, ...] chunk with positions [0, valid_len) from the tensor and
+        positions [valid_len, C) zero-padded.
+    """
+    chunk = tensor[:, start:start + valid_len]
+    if valid_len < chunk_size:
+        pad_widths = [(0, 0)] * tensor.ndim
+        pad_widths[1] = (0, chunk_size - valid_len)
+        chunk = jnp.pad(chunk, pad_widths)
+    return chunk
+
+
+def write_chunk(
+    buf: jnp.ndarray,
+    chunk: jnp.ndarray,
+    start: int,
+    valid_len: int,
+) -> jnp.ndarray:
+    """Write valid positions of a chunk into the output buffer.
+
+    Args:
+        buf: [1, T, ...] output buffer.
+        chunk: [1, C, ...] chunk data.
+        start: token-level start position along axis 1.
+        valid_len: number of valid positions to write.
+
+    Returns:
+        Updated buf with chunk[:, :valid_len] written at start.
+    """
+    return buf.at[:, start:start + valid_len].set(chunk[:, :valid_len])
+
+
 def acc_dtype(input_dtype) -> jnp.dtype:
     """Accumulator dtype: fp64 for fp64 inputs, fp32 otherwise."""
     return jnp.float64 if input_dtype == jnp.float64 else jnp.float32

@@ -38,9 +38,9 @@ from tops.cpu.ops.common.utils import acc_dtype as _acc_dtype
 from tops.cpu.ops.common.utils import cdiv as _cdiv
 from tops.cpu.ops.common.utils import dot as _dot
 from tops.cpu.ops.common.utils import pad_to_multiple as _pad_to_multiple
-from tops.cpu.ops.common.utils import gather_chunks, scatter_chunks
-from tops.utils import prepare_chunk_indices, prepare_lens
-from tops.utils import cdiv as _cdiv_top
+from tops.cpu.ops.common.utils import read_chunk as _read_chunk
+from tops.cpu.ops.common.utils import write_chunk as _write_chunk
+from tops.utils import prepare_chunk_indices
 from tops.cpu.ops.common.chunk_h import chunk_fwd_h, chunk_bwd_dh
 from tops.cpu.ops.common.chunk_o import chunk_fwd_o, chunk_local_cumsum
 
@@ -49,7 +49,7 @@ from tops.cpu.ops.common.chunk_o import chunk_fwd_o, chunk_local_cumsum
 # Orchestrator: chunk_simple_gla_fwd
 # =============================================================================
 
-
+@cpu_reference
 def chunk_simple_gla_fwd(
   q: jnp.ndarray,
   k: jnp.ndarray,
@@ -65,18 +65,21 @@ def chunk_simple_gla_fwd(
   """Chunk Simple GLA forward orchestrator. No blanket dtype upcast.
 
   Orchestrates the chunk-based forward pass:
-  1. Varlen pad (if cu_seqlens provided)
-  2. Pad T to multiple of chunk_size
-  3. Compute chunk-local cumsum of g (if provided)
-  4. Propagate hidden states via chunk_fwd_h
-  5. Compute output via chunk_fwd_o
-  6. Unpad output to original T
+  1. Pad T to multiple of chunk_size (non-varlen only)
+  2. Compute chunk-local cumsum of g (if provided)
+  3. Propagate hidden states via chunk_fwd_h
+  4. Compute output via chunk_fwd_o
+  5. Unpad output to original T (non-varlen only)
+
+  When cu_seqlens is provided, sub-functions handle varlen internally
+  via per-sequence/per-chunk iteration on packed tensors.
 
   Args:
-      q: [B, T, H, K] -- queries (input dtype)
-      k: [B, T, H, K] -- keys (input dtype)
-      v: [B, T, H, V] -- values (input dtype)
+      q: [B, T, H, K] -- queries (input dtype). Packed layout when varlen.
+      k: [B, T, H, K] -- keys (input dtype). Packed layout when varlen.
+      v: [B, T, H, V] -- values (input dtype). Packed layout when varlen.
       g: [B, T, H] -- per-head scalar gates (any dtype). Optional.
+          Packed layout when varlen.
       g_gamma: [H] -- fixed per-head log-decay. Optional.
       scale: scaling factor
       initial_state: [B, H, K, V] or [N, H, K, V] -- initial hidden state (fp32). Optional.
@@ -86,93 +89,40 @@ def chunk_simple_gla_fwd(
           When provided, B must be 1 and sequences are treated independently.
 
   Returns:
-      (o, ht) -- o in v.dtype unpadded to original T, ht in fp32 or None
+      (o, ht) -- o in v.dtype, ht in fp32 or None
   """
   T_orig = q.shape[1]
-  H = q.shape[2]
-  K = q.shape[3]
-  V = v.shape[-1]
   C = chunk_size
 
-  # --- Varlen gather+flatten ---
-  is_varlen = cu_seqlens is not None
-  if is_varlen:
-    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
-    total_NT = chunk_indices.shape[0]
-
-    # Gather to chunked layout [total_NT, C, ...]
-    q_c, valid_lens = gather_chunks(q, cu_seqlens, chunk_indices, C)
-    k_c, _ = gather_chunks(k, cu_seqlens, chunk_indices, C)
-    v_c, _ = gather_chunks(v, cu_seqlens, chunk_indices, C)
-    if g is not None:
-      g_c, _ = gather_chunks(g, cu_seqlens, chunk_indices, C)
-    # g_gamma is [H], NOT gathered
-
-    # chunk_local_cumsum on chunked layout
-    if g is not None:
-      g_c = chunk_local_cumsum(g_c, C, cu_seqlens=cu_seqlens)
-
-    # Flatten to [1, total_NT*C, ...]
-    q = q_c.reshape(1, total_NT * C, H, K)
-    k = k_c.reshape(1, total_NT * C, H, K)
-    v = v_c.reshape(1, total_NT * C, H, V)
-    if g is not None:
-      g = g_c.reshape(1, total_NT * C, H)
-
-    # Build flat cu_seqlens for boundary reset
-    lens = prepare_lens(cu_seqlens)
-    orig_seqlens = [int(l) for l in lens]
-    n_chunks_per_seq = jnp.array([int(_cdiv_top(int(l), C)) for l in lens])
-    flat_cu_seqlens = jnp.concatenate([
-      jnp.zeros(1, dtype=jnp.int32),
-      jnp.cumsum(n_chunks_per_seq * C),
-    ])
-
-    T_padded = total_NT * C
-  else:
-    flat_cu_seqlens = None
-    orig_seqlens = None
-
-    T = q.shape[1]
-    # Padding
-    T_padded = _cdiv(T, C) * C
-    if T_padded > T:
+  # Pad to chunk_size multiple (non-varlen only; varlen handles internally)
+  if cu_seqlens is None:
+    T_padded = _cdiv(T_orig, C) * C
+    if T_padded > T_orig:
       q = _pad_to_multiple(q, C, axis=1)
       k = _pad_to_multiple(k, C, axis=1)
       v = _pad_to_multiple(v, C, axis=1)
       if g is not None:
         g = _pad_to_multiple(g, C, axis=1)
 
-    # Chunk-local cumsum of g
-    if g is not None:
-      g = chunk_local_cumsum(g, C)
+  if g is not None:
+    g = chunk_local_cumsum(g, C, cu_seqlens=cu_seqlens)
 
-  # Hidden state propagation: states_in_fp32=False -> h in k.dtype
   h, ht = chunk_fwd_h(
-    k,
-    v,
-    g=g,
-    g_gamma=g_gamma,
-    h0=initial_state,
+    k, v,
+    g=g, g_gamma=g_gamma, h0=initial_state,
     output_final_state=output_final_state,
-    chunk_size=C,
-    states_in_fp32=False,
-    original_T=T_orig if not is_varlen else None,
-    cu_seqlens=flat_cu_seqlens if is_varlen else None,
-    orig_seqlens=orig_seqlens,
+    chunk_size=C, states_in_fp32=False,
+    original_T=None if cu_seqlens is not None else T_orig,
+    cu_seqlens=cu_seqlens,
   )
 
-  # Output computation
-  o = chunk_fwd_o(q, k, v, h, g=g, g_gamma=g_gamma, scale=scale, chunk_size=C)
+  o = chunk_fwd_o(
+    q, k, v, h,
+    g=g, g_gamma=g_gamma, scale=scale,
+    chunk_size=C, cu_seqlens=cu_seqlens,
+  )
 
-  # Scatter output back to packed layout
-  if is_varlen:
-    o_c = o.reshape(total_NT, C, H, V)
-    o = scatter_chunks(
-      jnp.zeros((1, T_orig, H, V), dtype=o.dtype),
-      o_c, cu_seqlens, chunk_indices, C, valid_lens,
-    )
-  else:
+  if cu_seqlens is None:
     o = o[:, :T_orig]
 
   return o, ht
@@ -195,37 +145,172 @@ def chunk_bwd_dqkwg(
   scale: float = 1.0,
   chunk_size: int = 64,
   original_T: int | None = None,
+  cu_seqlens: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
   """Backward gradients for q, k, and g (Simple GLA).
 
   Phase 1: V-loop computes b_ds, b_dq, b_dk (and b_dg_last for USE_G).
   Phase 2: Gate application (g / g_gamma / else are MUTUALLY EXCLUSIVE).
 
+  When cu_seqlens is provided, iterates over global chunk indices from
+  prepare_chunk_indices, reading inputs from packed tensors via read_chunk
+  and writing outputs via write_chunk. Matches Triton chunk_bwd_kernel_dqkwg.
+
   Args:
-      q:  [B, T, H, K] -- input dtype
-      k:  [B, T, H, K] -- input dtype
-      v:  [B, T, H, V] -- input dtype
-      h:  [B, NT, H, K, V] -- hidden states (fp32, from bwd recompute)
-      dh: [B, NT, H, K, V] -- hidden state gradients (fp32)
-      do: [B, T, H, V] -- output gradient (input dtype)
-      g:  [B, T, H] -- cumsummed gates (fp32). Optional.
+      q:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      k:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      v:  [B, T, H, V] -- input dtype. Packed layout when varlen.
+      h:  [B, total_NT, H, K, V] -- hidden states (fp32, from bwd recompute)
+      dh: [B, total_NT, H, K, V] -- hidden state gradients (fp32)
+      do: [B, T, H, V] -- output gradient (input dtype). Packed layout when varlen.
+      g:  [B, T, H] -- cumsummed gates (fp32). Optional. Packed layout when varlen.
       g_gamma: [H] -- fixed per-head log-decay. Optional.
       scale: scaling factor
       chunk_size: block size
-      original_T: original unpadded T (for g_gamma chunk_len computation)
+      original_T: original unpadded T (for g_gamma chunk_len computation).
+          Not used when cu_seqlens is provided.
+      cu_seqlens: [N+1] cumulative sequence lengths for variable-length
+          packing. When provided, B must be 1.
 
   Returns:
-      dq: [B, T, H, K] -- input dtype
-      dk: [B, T, H, K] -- input dtype
-      dg: [B, T, H] -- fp32, or None (when only g_gamma or no gate)
+      dq: [B, T, H, K] -- input dtype. Packed layout when varlen.
+      dk: [B, T, H, K] -- input dtype. Packed layout when varlen.
+      dg: [B, T, H] -- fp32, or None (when only g_gamma or no gate).
+          Packed layout when varlen.
   """
   B, T, H, K = q.shape
   V = v.shape[-1]
   C = chunk_size
-  NT = T // C
   acc = _acc_dtype(q.dtype)
   if original_T is None:
     original_T = T
+
+  # Causal mask [C, C]: lower-triangular (i >= j)
+  causal_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
+
+  # =====================================================================
+  # Varlen path: iterate over global chunk indices
+  # =====================================================================
+  if cu_seqlens is not None:
+    assert B == 1, f"cu_seqlens requires B=1, got B={B}"
+    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+    total_NT = chunk_indices.shape[0]
+
+    dq_buf = jnp.zeros((1, T, H, K), dtype=q.dtype)
+    dk_buf = jnp.zeros((1, T, H, K), dtype=k.dtype)
+    dg_buf = jnp.zeros((1, T, H), dtype=acc) if g is not None else None
+
+    for i_tg in range(total_NT):
+      i_n = int(chunk_indices[i_tg, 0])
+      i_t = int(chunk_indices[i_tg, 1])
+      bos = int(cu_seqlens[i_n])
+      eos = int(cu_seqlens[i_n + 1])
+      T_seq = eos - bos
+      valid_len = min(C, T_seq - i_t * C)
+
+      start = bos + i_t * C
+      b_q = _read_chunk(q, start, valid_len, C)    # [1, C, H, K]
+      b_k = _read_chunk(k, start, valid_len, C)    # [1, C, H, K]
+      b_v = _read_chunk(v, start, valid_len, C)    # [1, C, H, V]
+      b_do = _read_chunk(do, start, valid_len, C)  # [1, C, H, V]
+      b_h = h[:, i_tg]   # [1, H, K, V] fp32
+      b_dh = dh[:, i_tg] # [1, H, K, V] fp32
+
+      # Phase 1: V-loop
+      b_ds = _dot("bihv,bjhv->bihj", b_do, b_v, acc)
+      b_dq = _dot("bchv,bhkv->bchk", b_do, b_h.astype(do.dtype), acc)
+      b_dk = _dot("bchv,bhkv->bchk", b_v, b_dh.astype(v.dtype), acc)
+
+      # Phase 2: Gate application (mutually exclusive)
+      if g is not None:
+        gc = _read_chunk(g, start, valid_len, C)  # [1, C, H]
+        # For partial chunks, g_last must come from the last valid position
+        g_last = g[:, start + valid_len - 1 : start + valid_len]  # [1, 1, H]
+        g_last = g_last[:, 0]  # [1, H]
+        gc_key = jnp.transpose(gc, (0, 2, 1))  # [1, H, C]
+
+        b_dg_last = jnp.sum(b_h.astype(acc) * b_dh, axis=(-2, -1))
+        b_dg_last = b_dg_last * jnp.exp(g_last)
+
+        b_dq = b_dq * jnp.exp(gc[..., None]) * scale
+        b_dg = jnp.sum(b_dq * b_q.astype(acc), axis=-1)
+
+        b_dk = b_dk * jnp.exp(-gc[..., None] + g_last[:, None, :, None])
+        b_dg -= jnp.sum(b_k.astype(acc) * b_dk, axis=-1)
+        b_dg_last = b_dg_last + jnp.sum(b_dk * b_k.astype(acc), axis=(1, 3))
+
+        b_ds = (
+          jnp.where(
+            causal_mask[None, :, None, :],
+            b_ds * jnp.exp(gc[:, :, :, None] - gc_key[:, None, :, :]),
+            0,
+          )
+          * scale
+        )
+
+        b_qk = _dot("bihk,bjhk->bihj", b_q.astype(acc), b_k.astype(acc), acc)
+        b_ds2 = b_ds * b_qk
+        b_dg = (
+          b_dg
+          + jnp.sum(b_ds2, axis=-1)
+          - jnp.transpose(jnp.sum(b_ds2, axis=1), (0, 2, 1))
+        )
+
+        b_dq = b_dq + _dot("bihj,bjhk->bihk", b_ds.astype(k.dtype), b_k, acc)
+        b_dk = b_dk + _dot(
+          "bjhi,bihk->bjhk", jnp.transpose(b_ds, (0, 3, 2, 1)).astype(q.dtype), b_q, acc
+        )
+
+        last_mask = jnp.zeros((C,), dtype=acc)
+        last_mask = last_mask.at[-1].set(1.0)
+        b_dg = b_dg + b_dg_last[:, None, :] * last_mask[None, :, None]
+
+        dg_buf = _write_chunk(dg_buf, b_dg, start, valid_len)
+
+      elif g_gamma is not None:
+        gamma = g_gamma  # [H]
+        chunk_len = valid_len
+        b_g_gamma = gamma[None, :] * jnp.arange(1, C + 1, dtype=acc)[:, None]  # [C, H]
+        g_gamma_last = gamma * chunk_len  # [H]
+        b_g_gamma_key = b_g_gamma.T  # [H, C]
+
+        b_dq = b_dq * jnp.exp(b_g_gamma[None, :, :, None]) * scale
+        b_dk = b_dk * jnp.exp(
+          -b_g_gamma[None, :, :, None] + g_gamma_last[None, None, :, None]
+        )
+
+        b_ds = (
+          jnp.where(
+            causal_mask[None, :, None, :],
+            b_ds * jnp.exp(b_g_gamma[None, :, :, None] - b_g_gamma_key[None, None, :, :]),
+            0,
+          )
+          * scale
+        )
+
+        b_dq = b_dq + _dot("bihj,bjhk->bihk", b_ds.astype(k.dtype), b_k, acc)
+        b_dk = b_dk + _dot(
+          "bjhi,bihk->bjhk", jnp.transpose(b_ds, (0, 3, 2, 1)).astype(q.dtype), b_q, acc
+        )
+
+      else:
+        b_ds = jnp.where(causal_mask[None, :, None, :], b_ds, 0).astype(k.dtype)
+        b_dq = b_dq + _dot("bihj,bjhk->bihk", b_ds, b_k, acc)
+        b_dk = (
+          b_dk
+          + _dot("bjhi,bihk->bjhk", jnp.transpose(b_ds, (0, 3, 2, 1)), b_q, acc) * scale
+        )
+        b_dq = b_dq * scale
+
+      dq_buf = _write_chunk(dq_buf, b_dq.astype(q.dtype), start, valid_len)
+      dk_buf = _write_chunk(dk_buf, b_dk.astype(k.dtype), start, valid_len)
+
+    return dq_buf, dk_buf, dg_buf
+
+  # =====================================================================
+  # Non-varlen path: standard uniform-chunk iteration
+  # =====================================================================
+  NT = T // C
 
   q_c = q.reshape(B, NT, C, H, K)
   k_c = k.reshape(B, NT, C, H, K)
@@ -398,6 +483,7 @@ def chunk_bwd_dv(
   scale: float = 1.0,
   chunk_size: int = 64,
   original_T: int | None = None,
+  cu_seqlens: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
   """Backward gradient for v (Simple GLA).
 
@@ -405,36 +491,118 @@ def chunk_bwd_dv(
   The attention matrix here uses UPPER-triangular mask (i >= j), which is
   the transpose of the forward causal mask.
 
+  When cu_seqlens is provided, iterates over global chunk indices from
+  prepare_chunk_indices, reading inputs from packed tensors via read_chunk
+  and writing outputs via write_chunk. Matches Triton chunk_bwd_kernel_dv.
+
   Args:
-      q:  [B, T, H, K] -- input dtype
-      k:  [B, T, H, K] -- input dtype
-      do: [B, T, H, V] -- output gradient (input dtype)
-      dh: [B, NT, H, K, V] -- hidden state gradients (fp32)
-      g:  [B, T, H] -- cumsummed gates (fp32). Optional.
+      q:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      k:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      do: [B, T, H, V] -- output gradient (input dtype). Packed layout when varlen.
+      dh: [B, total_NT, H, K, V] -- hidden state gradients (fp32)
+      g:  [B, T, H] -- cumsummed gates (fp32). Optional. Packed layout when varlen.
       g_gamma: [H] -- fixed per-head log-decay. Optional.
       scale: scaling factor
       chunk_size: block size
-      original_T: original unpadded T (for g_gamma chunk_len computation)
+      original_T: original unpadded T (for g_gamma chunk_len computation).
+          Not used when cu_seqlens is provided.
+      cu_seqlens: [N+1] cumulative sequence lengths for variable-length
+          packing. When provided, B must be 1.
 
   Returns:
-      dv: [B, T, H, V] -- do.dtype
+      dv: [B, T, H, V] -- do.dtype. Packed layout when varlen.
   """
   B, T, H, K = q.shape
   V = do.shape[-1]
   C = chunk_size
-  NT = T // C
   acc = _acc_dtype(q.dtype)
   if original_T is None:
     original_T = T
+
+  # Upper-triangular mask [C, C]: i >= j (transpose of forward causal)
+  upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.bool_))
+
+  # =====================================================================
+  # Varlen path: iterate over global chunk indices
+  # =====================================================================
+  if cu_seqlens is not None:
+    assert B == 1, f"cu_seqlens requires B=1, got B={B}"
+    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+    total_NT = chunk_indices.shape[0]
+
+    dv_buf = jnp.zeros((1, T, H, V), dtype=do.dtype)
+
+    for i_tg in range(total_NT):
+      i_n = int(chunk_indices[i_tg, 0])
+      i_t = int(chunk_indices[i_tg, 1])
+      bos = int(cu_seqlens[i_n])
+      eos = int(cu_seqlens[i_n + 1])
+      T_seq = eos - bos
+      valid_len = min(C, T_seq - i_t * C)
+
+      start = bos + i_t * C
+      b_q = _read_chunk(q, start, valid_len, C)    # [1, C, H, K]
+      b_k = _read_chunk(k, start, valid_len, C)    # [1, C, H, K]
+      b_do = _read_chunk(do, start, valid_len, C)  # [1, C, H, V]
+      b_dh = dh[:, i_tg]  # [1, H, K, V] fp32
+
+      # Intra: A = k @ q^T [1, j, H, i]
+      b_A = _dot("bjhk,bihk->bjhi", b_k, b_q, acc)
+
+      # Inter: k @ dh -> dv [1, C, H, V]
+      b_dv = _dot("bchk,bhkv->bchv", b_k, b_dh.astype(k.dtype), acc)
+
+      if g is not None:
+        gc = _read_chunk(g, start, valid_len, C)  # [1, C, H]
+        g_last = g[:, start + valid_len - 1 : start + valid_len][:, 0]  # [1, H]
+        gc_i = jnp.transpose(gc, (0, 2, 1))  # [1, H, C]
+
+        b_A = jnp.where(
+          upper_mask[None, :, None, :],
+          b_A * jnp.exp(gc_i[:, None, :, :] - gc[:, :, :, None]) * scale,
+          0,
+        ).astype(do.dtype)
+
+        b_dv = b_dv * jnp.exp(-gc[..., None] + g_last[:, None, :, None])
+
+      elif g_gamma is not None:
+        gamma = g_gamma  # [H]
+        chunk_len = valid_len
+        b_g_gamma = gamma[None, :] * jnp.arange(1, C + 1, dtype=acc)[:, None]  # [C, H]
+        g_gamma_last = gamma * chunk_len  # [H]
+        b_g_gamma_i = b_g_gamma.T  # [H, C]
+
+        b_A = jnp.where(
+          upper_mask[None, :, None, :],
+          b_A
+          * jnp.exp(b_g_gamma_i[None, None, :, :] - b_g_gamma[None, :, :, None])
+          * scale,
+          0,
+        ).astype(do.dtype)
+
+        b_dv = b_dv * jnp.exp(
+          -b_g_gamma[None, :, :, None] + g_gamma_last[None, None, :, None]
+        )
+
+      else:
+        b_A = jnp.where(upper_mask[None, :, None, :], b_A * scale, 0).astype(do.dtype)
+
+      b_dv = b_dv + _dot("bjhi,bihv->bjhv", b_A, b_do, acc)
+
+      dv_buf = _write_chunk(dv_buf, b_dv.astype(do.dtype), start, valid_len)
+
+    return dv_buf
+
+  # =====================================================================
+  # Non-varlen path: standard uniform-chunk iteration
+  # =====================================================================
+  NT = T // C
 
   q_c = q.reshape(B, NT, C, H, K)
   k_c = k.reshape(B, NT, C, H, K)
   do_c = do.reshape(B, NT, C, H, V)
   if g is not None:
     g_c = g.reshape(B, NT, C, H)
-
-  # Upper-triangular mask [C, C]: i >= j (transpose of forward causal)
-  upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.bool_))
 
   dv_chunks = []
 
@@ -453,19 +621,14 @@ def chunk_bwd_dv(
     if g is not None:
       gc = g_c[:, i]  # [B, C, H]
       g_last = gc[:, -1]  # [B, H]
-      # Transpose for i-position broadcasting: [B, H, C]
-      gc_i = jnp.transpose(gc, (0, 2, 1))
+      gc_i = jnp.transpose(gc, (0, 2, 1))  # [B, H, C]
 
-      # Upper-triangular mask with gate: exp(g_i - g_j) where i >= j
-      # b_A is [B, j, H, i]
-      # gc[:, :, :, None] = [B, C_j, H, 1]; gc_i[:, None, :, :] = [B, 1, H, C_i]
       b_A = jnp.where(
-        upper_mask[None, :, None, :],  # [1, j, 1, i]
+        upper_mask[None, :, None, :],
         b_A * jnp.exp(gc_i[:, None, :, :] - gc[:, :, :, None]) * scale,
         0,
       ).astype(do.dtype)
 
-      # Gate dv with exp(-g + g_last)
       b_dv = b_dv * jnp.exp(-gc[..., None] + g_last[:, None, :, None])
 
     elif g_gamma is not None:
@@ -473,12 +636,8 @@ def chunk_bwd_dv(
       chunk_len = min(C, original_T - i * C)
       b_g_gamma = gamma[None, :] * jnp.arange(1, C + 1, dtype=acc)[:, None]  # [C, H]
       g_gamma_last = gamma * chunk_len  # [H]
-      # Transpose for i-position broadcasting: [H, C]
-      b_g_gamma_i = b_g_gamma.T
+      b_g_gamma_i = b_g_gamma.T  # [H, C]
 
-      # Upper-triangular mask with gate: exp(g_gamma_i - g_gamma_j)
-      # b_g_gamma[None, :, :, None] = [1, C_j, H, 1]
-      # b_g_gamma_i[None, None, :, :] = [1, 1, H, C_i]
       b_A = jnp.where(
         upper_mask[None, :, None, :],
         b_A
@@ -487,16 +646,13 @@ def chunk_bwd_dv(
         0,
       ).astype(do.dtype)
 
-      # Gate dv
       b_dv = b_dv * jnp.exp(
         -b_g_gamma[None, :, :, None] + g_gamma_last[None, None, :, None]
       )
 
     else:
-      # No gate
       b_A = jnp.where(upper_mask[None, :, None, :], b_A * scale, 0).astype(do.dtype)
 
-    # dv += A^T @ do  (A is [B, j, H, i], do is [B, i, H, V])
     b_dv = b_dv + _dot("bjhi,bihv->bjhv", b_A, b_do, acc)
 
     dv_chunks.append(b_dv.astype(do.dtype))
@@ -509,7 +665,7 @@ def chunk_bwd_dv(
 # Backward orchestrator: chunk_simple_gla_bwd
 # =============================================================================
 
-
+@cpu_reference
 def chunk_simple_gla_bwd(
   q: jnp.ndarray,
   k: jnp.ndarray,
@@ -528,24 +684,27 @@ def chunk_simple_gla_bwd(
   """Chunk Simple GLA backward orchestrator.
 
   Orchestrates the backward pass:
-  1. Varlen pad (if cu_seqlens provided)
-  2. Pad inputs to multiple of chunk_size
-  3. Compute chunk-local cumsum of g (if provided)
-  4. Recompute h with states_in_fp32=True
-  5. Compute dh via chunk_bwd_dh
-  6. Compute dq, dk, dg via chunk_bwd_dqkwg
-  7. Compute dv via chunk_bwd_dv
-  8. If dg is not None: reverse cumsum (stays fp32)
-  9. Unpad
+  1. Pad inputs to multiple of chunk_size (non-varlen only)
+  2. Compute chunk-local cumsum of g (if provided)
+  3. Recompute h with states_in_fp32=True
+  4. Compute dh via chunk_bwd_dh
+  5. Compute dq, dk, dg via chunk_bwd_dqkwg
+  6. Compute dv via chunk_bwd_dv
+  7. If dg is not None: reverse cumsum (stays fp32)
+  8. Unpad (non-varlen only)
+
+  When cu_seqlens is provided, sub-functions handle varlen internally
+  via per-sequence/per-chunk iteration on packed tensors.
 
   Args:
-      q:  [B, T, H, K] -- input dtype
-      k:  [B, T, H, K] -- input dtype
-      v:  [B, T, H, V] -- input dtype
+      q:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      k:  [B, T, H, K] -- input dtype. Packed layout when varlen.
+      v:  [B, T, H, V] -- input dtype. Packed layout when varlen.
       g:  [B, T, H] -- raw per-head scalar gates (NOT cumsummed). Optional.
+          Packed layout when varlen.
       g_gamma: [H] -- fixed per-head log-decay. Optional.
       initial_state: [B, H, K, V] or [N, H, K, V] -- fp32. Optional.
-      do: [B, T, H, V] -- output gradient (input dtype)
+      do: [B, T, H, V] -- output gradient (input dtype). Packed layout when varlen.
       dht: [B, H, K, V] or [N, H, K, V] -- terminal hidden state gradient (fp32). Optional.
       scale: scaling factor
       chunk_size: block size
@@ -560,9 +719,6 @@ def chunk_simple_gla_bwd(
       dh0: [B, H, K, V] or [N, H, K, V] -- fp32, or None
   """
   T_orig = q.shape[1]
-  H = q.shape[2]
-  K = q.shape[3]
-  V = v.shape[-1]
   C = chunk_size
 
   assert not (g is not None and g_gamma is not None), (
@@ -571,51 +727,10 @@ def chunk_simple_gla_bwd(
     "gradients would be incorrect. Use only one of g or g_gamma."
   )
 
-  # --- Varlen gather+flatten ---
-  is_varlen = cu_seqlens is not None
-  if is_varlen:
-    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
-    total_NT = chunk_indices.shape[0]
-
-    # Gather to chunked layout [total_NT, C, ...]
-    q_c, valid_lens = gather_chunks(q, cu_seqlens, chunk_indices, C)
-    k_c, _ = gather_chunks(k, cu_seqlens, chunk_indices, C)
-    v_c, _ = gather_chunks(v, cu_seqlens, chunk_indices, C)
-    do_c, _ = gather_chunks(do, cu_seqlens, chunk_indices, C)
-    if g is not None:
-      g_c, _ = gather_chunks(g, cu_seqlens, chunk_indices, C)
-    # g_gamma is [H], NOT gathered
-
-    # chunk_local_cumsum on chunked layout
-    if g is not None:
-      g_c = chunk_local_cumsum(g_c, C, cu_seqlens=cu_seqlens)
-
-    # Flatten to [1, total_NT*C, ...]
-    q = q_c.reshape(1, total_NT * C, H, K)
-    k = k_c.reshape(1, total_NT * C, H, K)
-    v = v_c.reshape(1, total_NT * C, H, V)
-    do = do_c.reshape(1, total_NT * C, H, V)
-    if g is not None:
-      g = g_c.reshape(1, total_NT * C, H)
-
-    # Build flat cu_seqlens for boundary reset
-    lens = prepare_lens(cu_seqlens)
-    orig_seqlens = [int(l) for l in lens]
-    n_chunks_per_seq = jnp.array([int(_cdiv_top(int(l), C)) for l in lens])
-    flat_cu_seqlens = jnp.concatenate([
-      jnp.zeros(1, dtype=jnp.int32),
-      jnp.cumsum(n_chunks_per_seq * C),
-    ])
-
-    T_padded = total_NT * C
-  else:
-    flat_cu_seqlens = None
-    orig_seqlens = None
-
-    T = q.shape[1]
-    # Padding
-    T_padded = _cdiv(T, C) * C
-    if T_padded > T:
+  # Pad to chunk_size multiple (non-varlen only; varlen handles internally)
+  if cu_seqlens is None:
+    T_padded = _cdiv(T_orig, C) * C
+    if T_padded > T_orig:
       q = _pad_to_multiple(q, C, axis=1)
       k = _pad_to_multiple(k, C, axis=1)
       v = _pad_to_multiple(v, C, axis=1)
@@ -623,98 +738,47 @@ def chunk_simple_gla_bwd(
       if g is not None:
         g = _pad_to_multiple(g, C, axis=1)
 
-    # Chunk-local cumsum of g (same as forward orchestrator)
-    if g is not None:
-      g = chunk_local_cumsum(g, C)
+  if g is not None:
+    g = chunk_local_cumsum(g, C, cu_seqlens=cu_seqlens)
 
-  # Recompute h with states_in_fp32=True (backward needs fp32 states)
   h, _ = chunk_fwd_h(
-    k,
-    v,
-    g=g,
-    g_gamma=g_gamma,
-    h0=initial_state,
+    k, v,
+    g=g, g_gamma=g_gamma, h0=initial_state,
     output_final_state=False,
-    chunk_size=C,
-    states_in_fp32=True,
-    original_T=T_orig if not is_varlen else None,
-    cu_seqlens=flat_cu_seqlens if is_varlen else None,
-    orig_seqlens=orig_seqlens,
+    chunk_size=C, states_in_fp32=True,
+    original_T=None if cu_seqlens is not None else T_orig,
+    cu_seqlens=cu_seqlens,
   )
 
-  # dh: backward hidden state gradient propagation
   dh, dh0 = chunk_bwd_dh(
-    q,
-    do,
-    g=g,
-    g_gamma=g_gamma,
-    h0=initial_state,
-    dht=dht,
-    scale=scale,
-    chunk_size=C,
-    original_T=T_orig if not is_varlen else None,
-    cu_seqlens=flat_cu_seqlens if is_varlen else None,
-    orig_seqlens=orig_seqlens,
+    q, do,
+    g=g, g_gamma=g_gamma, h0=initial_state, dht=dht,
+    scale=scale, chunk_size=C,
+    original_T=None if cu_seqlens is not None else T_orig,
+    cu_seqlens=cu_seqlens,
   )
 
-  # dq, dk, dg
   dq, dk, dg = chunk_bwd_dqkwg(
-    q,
-    k,
-    v,
-    h,
-    dh,
-    do,
-    g=g,
-    g_gamma=g_gamma,
-    scale=scale,
+    q, k, v, h, dh, do,
+    g=g, g_gamma=g_gamma, scale=scale,
     chunk_size=C,
-    original_T=T_orig if not is_varlen else None,
+    original_T=None if cu_seqlens is not None else T_orig,
+    cu_seqlens=cu_seqlens,
   )
 
-  # dv
   dv = chunk_bwd_dv(
-    q,
-    k,
-    do,
-    dh,
-    g=g,
-    g_gamma=g_gamma,
-    scale=scale,
+    q, k, do, dh,
+    g=g, g_gamma=g_gamma, scale=scale,
     chunk_size=C,
-    original_T=T_orig if not is_varlen else None,
+    original_T=None if cu_seqlens is not None else T_orig,
+    cu_seqlens=cu_seqlens,
   )
 
-  # Reverse cumsum of dg (keep fp32, matching FLA internal bwd + GLA CPU ref;
-  # note: FLA autograd wrapper casts dg to g.dtype via .to(g), we intentionally
-  # keep fp32 for gradient precision, same as GLA CPU ref)
   if dg is not None:
-    dg = chunk_local_cumsum(dg, C, reverse=True)
+    dg = chunk_local_cumsum(dg, C, reverse=True, cu_seqlens=cu_seqlens)
 
-  # Scatter gradients back to packed layout
-  if is_varlen:
-    dq_c = dq.reshape(total_NT, C, H, K)
-    dk_c = dk.reshape(total_NT, C, H, K)
-    dv_c = dv.reshape(total_NT, C, H, V)
-    dq = scatter_chunks(
-      jnp.zeros((1, T_orig, H, K), dtype=dq.dtype),
-      dq_c, cu_seqlens, chunk_indices, C, valid_lens,
-    )
-    dk = scatter_chunks(
-      jnp.zeros((1, T_orig, H, K), dtype=dk.dtype),
-      dk_c, cu_seqlens, chunk_indices, C, valid_lens,
-    )
-    dv = scatter_chunks(
-      jnp.zeros((1, T_orig, H, V), dtype=dv.dtype),
-      dv_c, cu_seqlens, chunk_indices, C, valid_lens,
-    )
-    if dg is not None:
-      dg_c = dg.reshape(total_NT, C, H)
-      dg = scatter_chunks(
-        jnp.zeros((1, T_orig, H), dtype=dg.dtype),
-        dg_c, cu_seqlens, chunk_indices, C, valid_lens,
-      )
-  else:
+  # Unpad (non-varlen only)
+  if cu_seqlens is None:
     dq = dq[:, :T_orig]
     dk = dk[:, :T_orig]
     dv = dv[:, :T_orig]
