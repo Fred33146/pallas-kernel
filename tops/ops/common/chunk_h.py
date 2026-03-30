@@ -54,7 +54,7 @@ def _chunk_fwd_h_kernel(
     @pl.when((i_t % NTS) == 0)
     def store_fn():
         i_s = i_t // NTS
-        h_ref[0, i_s, 0] = scratch_ref[...]
+        h_ref[0, i_s, 0] = scratch_ref[...].astype(h_ref.dtype)
 
     k_tile = k_ref[(0, 0, slice(None), slice(None))] # BT * BK
     v_tile = v_ref[(0, 0, slice(None), slice(None))] # BT * BV
@@ -154,21 +154,6 @@ def chunk_fwd_h_kernel(
         f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     )
     # =================== assert kernel requirements done ===================
-
-    # In interpret mode (CPU/GPU), use the pure JAX reference implementation
-    # to avoid Pallas interpret-mode tracing bugs with lax.fori_loop + lax.cond
-    # + nonlocal side effects that corrupt g_gamma computation for H>1.
-    if interpret:
-        h_all, ht_ref = chunk_fwd_h_ref(
-            k, v, g=g, g_gamma=g_gamma, gk=gk, gv=gv,
-            h0=h0, output_final_state=output_final_state,
-            states_in_fp32=states_in_fp32,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            chunk_size=chunk_size,
-        )
-        if output_final_state:
-            return h_all, ht_ref
-        return h_all, None
 
     # N: the actual number of sequences in the batch with either equal or variable lengths
 

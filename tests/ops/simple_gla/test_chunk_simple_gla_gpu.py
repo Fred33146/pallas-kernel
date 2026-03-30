@@ -190,7 +190,7 @@ def test_triton_chunk_vs_jax_chunk(cfg):
     # bf16 matmul accumulation order differs between CUDA (Triton) and JAX;
     # errors compound across chunks, so scale atol with NT.
     NT = T // CHUNK_SIZE
-    atol = cfg.get("atol", 5e-2)
+    atol = cfg.get("atol", min(5e-2, 5e-3 * NT))
     rtol = cfg.get("rtol", 1e-2)
     max_ulp = 2
     gate = cfg.get("gate", "none")
