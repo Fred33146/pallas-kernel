@@ -19,6 +19,7 @@ Simple GLA vs GLA:
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -27,130 +28,117 @@ from tops.cpu.ops.common import acc_dtype as _acc_dtype
 
 @cpu_reference
 def naive_simple_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    g: jnp.ndarray | None = None,
-    g_gamma: jnp.ndarray | None = None,
-    scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
-    output_final_state: bool = False,
+  q: jnp.ndarray,
+  k: jnp.ndarray,
+  v: jnp.ndarray,
+  g: jnp.ndarray | None = None,
+  g_gamma: jnp.ndarray | None = None,
+  scale: float | None = None,
+  initial_state: jnp.ndarray | None = None,
+  output_final_state: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
-    """Naive recurrent Simple GLA — JAX CPU reference with FLA-exact dtype behavior.
+  """Naive recurrent Simple GLA — JAX CPU reference with FLA-exact dtype behavior.
 
-    Simple GLA uses per-head scalar gates (g: [B,T,H]) instead of per-element
-    gates (gk: [B,T,H,K]) as in standard GLA. The scalar gate is broadcast
-    over both K and V dimensions when updating the hidden state.
+  Simple GLA uses per-head scalar gates (g: [B,T,H]) instead of per-element
+  gates (gk: [B,T,H,K]) as in standard GLA. The scalar gate is broadcast
+  over both K and V dimensions when updating the hidden state.
 
-    Core recurrence (per timestep):
-        gate_t = exp(g_t) [* exp(g_gamma)]       scalar per (B, H)
-        h_t = h_{t-1} * gate_t + k_t^T @ v_t    gate broadcast over [K, V]
-        o_t = (q_t * scale)^T @ h_t              sum over K dimension
+  Core recurrence (per timestep):
+      gate_t = exp(g_t) [* exp(g_gamma)]       scalar per (B, H)
+      h_t = h_{t-1} * gate_t + k_t^T @ v_t    gate broadcast over [K, V]
+      o_t = (q_t * scale)^T @ h_t              sum over K dimension
 
-    Dtype behavior (matching FLA):
-      - All inputs cast to fp32 for computation (`.float()` in PyTorch)
-      - Hidden state h is fp32 accumulator
-      - Output o computed in fp32, cast back to original dtype
-      - Final state h stays in fp32
-      - fp64 mode: all computation in fp64, no precision cast
+  Dtype behavior (matching FLA):
+    - All inputs cast to fp32 for computation (`.float()` in PyTorch)
+    - Hidden state h is fp32 accumulator
+    - Output o computed in fp32, cast back to original dtype
+    - Final state h stays in fp32
+    - fp64 mode: all computation in fp64, no precision cast
 
-    Args:
-        q:               [B, T, H, K] — Queries
-        k:               [B, T, H, K] — Keys
-        v:               [B, T, H, V] — Values
-        g:               [B, T, H]    — Per-head scalar gate in log-space (e.g., logsigmoid)
-                         Optional. If None and g_gamma is None, gate defaults to 1.0.
-        g_gamma:         [H]          — Fixed per-head log-decay, applied multiplicatively
-                         with g (i.e., combined gate = exp(g + g_gamma)).
-                         Must be in acc_dtype (fp32 or fp64). Optional.
-        scale:           Scalar query scale. Defaults to K ** -0.5.
-        initial_state:   [B, H, K, V] — Initial hidden state. Optional.
-        output_final_state: Whether to return the final hidden state.
+  Uses ``jax.lax.scan`` for the time-step loop so that ``jax.grad`` can
+  differentiate the recurrence efficiently (reverse-mode scan) instead of
+  unrolling T Python loop iterations into the computation graph.
 
-    Returns:
-        o:           [B, T, H, V] — Output (original input dtype)
-        final_state: [B, H, K, V] in fp32 (or fp64), or None
-    """
-    orig_dtype = q.dtype
-    acc_dt = _acc_dtype(orig_dtype)
+  Args:
+      q:               [B, T, H, K] — Queries
+      k:               [B, T, H, K] — Keys
+      v:               [B, T, H, V] — Values
+      g:               [B, T, H]    — Per-head scalar gate in log-space (e.g., logsigmoid)
+                       Optional. If None and g_gamma is None, gate defaults to 1.0.
+      g_gamma:         [H]          — Fixed per-head log-decay, applied multiplicatively
+                       with g (i.e., combined gate = exp(g + g_gamma)).
+                       Must be in acc_dtype (fp32 or fp64). Optional.
+      scale:           Scalar query scale. Defaults to K ** -0.5.
+      initial_state:   [B, H, K, V] — Initial hidden state. Optional.
+      output_final_state: Whether to return the final hidden state.
 
-    # Shape assertions (project coding standard)
-    assert q.ndim == 4, f"q must be 4D [B,T,H,K], got {q.ndim}D"
-    assert k.shape == q.shape, f"k shape {k.shape} != q shape {q.shape}"
-    assert v.ndim == 4 and v.shape[:3] == q.shape[:3], (
-        f"v shape {v.shape} incompatible with q shape {q.shape}"
+  Returns:
+      o:           [B, T, H, V] — Output (original input dtype)
+      final_state: [B, H, K, V] in fp32 (or fp64), or None
+  """
+  orig_dtype = q.dtype
+  acc_dt = _acc_dtype(orig_dtype)
+
+  # Shape assertions (project coding standard)
+  assert q.ndim == 4, f"q must be 4D [B,T,H,K], got {q.ndim}D"
+  assert k.shape == q.shape, f"k shape {k.shape} != q shape {q.shape}"
+  assert v.ndim == 4 and v.shape[:3] == q.shape[:3], (
+    f"v shape {v.shape} incompatible with q shape {q.shape}"
+  )
+  if g is not None:
+    assert g.ndim == 3 and g.shape == q.shape[:3], f"g shape {g.shape} != {q.shape[:3]}"
+  if g_gamma is not None:
+    assert g_gamma.ndim == 1 and g_gamma.shape[0] == q.shape[2], (
+      f"g_gamma shape {g_gamma.shape} != (H={q.shape[2]},)"
     )
-    if g is not None:
-        assert g.ndim == 3 and g.shape == q.shape[:3], (
-            f"g shape {g.shape} != {q.shape[:3]}"
-        )
+
+  # FLA: q, k, v = map(lambda x: x.transpose(1, 2).float(), ...)
+  # Transpose [B, T, H, D] -> [B, H, T, D] and cast to accumulator dtype
+  q_f, k_f, v_f = (jnp.transpose(x, (0, 2, 1, 3)).astype(acc_dt) for x in (q, k, v))
+  B, H, T, K = q_f.shape
+  V = v_f.shape[-1]
+
+  # Default scale: K ** -0.5
+  if scale is None:
+    scale = K**-0.5
+
+  # Precompute per-step gate: [B, H, T] → exp → [B, H, T]
+  # When no gate is active, use ones (multiplication identity).
+  if g is not None:
+    g_f = jnp.transpose(g, (0, 2, 1)).astype(acc_dt)  # [B, H, T]
     if g_gamma is not None:
-        assert g_gamma.ndim == 1 and g_gamma.shape[0] == q.shape[2], (
-            f"g_gamma shape {g_gamma.shape} != (H={q.shape[2]},)"
-        )
-
-    # FLA: q, k, v = map(lambda x: x.transpose(1, 2).float(), ...)
-    # Transpose [B, T, H, D] -> [B, H, T, D] and cast to accumulator dtype
-    q_f, k_f, v_f = (
-        jnp.transpose(x, (0, 2, 1, 3)).astype(acc_dt)
-        for x in (q, k, v)
-    )
-    if g is not None:
-        # Transpose [B, T, H] -> [B, H, T]
-        g_f = jnp.transpose(g, (0, 2, 1)).astype(acc_dt)
+      g_gamma_f = g_gamma.astype(acc_dt)
+      gate = jnp.exp(g_f + g_gamma_f[None, :, None])  # [B, H, T]
     else:
-        g_f = None
+      gate = jnp.exp(g_f)  # [B, H, T]
+  elif g_gamma is not None:
+    g_gamma_f = g_gamma.astype(acc_dt)
+    gate = jnp.broadcast_to(jnp.exp(g_gamma_f)[None, :, None], (B, H, T))  # [B, H, T]
+  else:
+    gate = jnp.ones((B, H, T), dtype=acc_dt)
 
-    # Cast g_gamma to acc_dt if provided
-    if g_gamma is not None:
-        g_gamma_f = g_gamma.astype(acc_dt)  # [H]
-    else:
-        g_gamma_f = None
+  # Initial hidden state
+  h0 = jnp.zeros((B, H, K, V), dtype=acc_dt)
+  if initial_state is not None:
+    h0 = h0 + initial_state.astype(acc_dt)
 
-    B, H, T, K = q_f.shape
-    V = v_f.shape[-1]
+  # Prepare scan inputs: move T axis to leading position
+  gate_seq = jnp.transpose(gate, (2, 0, 1))  # [T, B, H]
+  k_seq = jnp.transpose(k_f, (2, 0, 1, 3))  # [T, B, H, K]
+  v_seq = jnp.transpose(v_f, (2, 0, 1, 3))  # [T, B, H, V]
+  q_seq = jnp.transpose(q_f * scale, (2, 0, 1, 3))  # [T, B, H, K]
 
-    # Default scale: K ** -0.5
-    if scale is None:
-        scale = K ** -0.5
+  def step(h, xs):
+    gate_t, k_t, v_t, q_t = xs
+    # gate_t: [B, H], k_t: [B, H, K], v_t: [B, H, V], q_t: [B, H, K]
+    kv_t = k_t[..., None] * v_t[..., None, :]  # [B, H, K, V]
+    h = h * gate_t[:, :, None, None] + kv_t  # [B, H, K, V]
+    o_t = (q_t[..., None] * h).sum(-2)  # [B, H, V]
+    return h, o_t
 
-    # Output buffer and hidden state in acc_dt
-    o = jnp.zeros_like(v_f)       # [B, H, T, V]
-    h = jnp.zeros((B, H, K, V), dtype=acc_dt)
-    if initial_state is not None:
-        h = h + initial_state.astype(acc_dt)
+  h_final, o_seq = jax.lax.scan(step, h0, (gate_seq, k_seq, v_seq, q_seq))
+  # o_seq: [T, B, H, V] → [B, T, H, V]
+  o = jnp.transpose(o_seq, (1, 0, 2, 3))
 
-    for t in range(T):
-        q_t = q_f[:, :, t] * scale   # [B, H, K]
-        k_t = k_f[:, :, t]            # [B, H, K]
-        v_t = v_f[:, :, t]            # [B, H, V]
-
-        # Compute gate: scalar per (B, H), broadcast to [B, H, K, V]
-        if g_f is not None:
-            gate = jnp.exp(g_f[:, :, t])   # [B, H]
-            if g_gamma_f is not None:
-                # Combine with fixed per-head decay multiplicatively
-                gate = gate * jnp.exp(g_gamma_f)[None, :]  # [B, H]
-        elif g_gamma_f is not None:
-            gate = jnp.broadcast_to(jnp.exp(g_gamma_f)[None, :], (B, H))  # [B, H]
-        else:
-            gate = None
-
-        # Outer product k_t^T @ v_t
-        kv_t = k_t[..., None] * v_t[..., None, :]   # [B, H, K, V]
-
-        if gate is not None:
-            h = h * gate[:, :, None, None] + kv_t
-        else:
-            h = h + kv_t
-
-        o = o.at[:, :, t].set(
-            (q_t[..., None] * h).sum(
-                -2,
-                # No explicit precision kwarg needed; acc_dt controls precision
-            )                                        # [B, H, V]
-        )
-
-    final_state = h if output_final_state else None
-    # Transpose [B, H, T, V] -> [B, T, H, V] and cast back to original dtype
-    return jnp.transpose(o, (0, 2, 1, 3)).astype(orig_dtype), final_state
+  final_state = h_final if output_final_state else None
+  return o.astype(orig_dtype), final_state
