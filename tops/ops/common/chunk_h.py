@@ -761,7 +761,7 @@ def _chunk_bwd_dh_kernel(
         b_q = (b_q * exp(b_gk)).astype(b_q.dtype)
 
     b_dh = b_dh + jax.lax.dot(
-        b_q.astype(jnp.float32).T, b_do,
+        b_q.astype(jnp.float32).T, b_do.astype(jnp.float32),
         precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
