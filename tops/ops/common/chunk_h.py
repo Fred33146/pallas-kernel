@@ -388,6 +388,7 @@ def chunk_fwd_h_ref(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Inter-chunk hidden state propagation.
 
@@ -603,6 +604,7 @@ def chunk_bwd_dh_ref(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Backward hidden state gradient propagation.
 

@@ -5,8 +5,8 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-from tops.ops.common.chunk_h import chunk_fwd_h_ref as chunk_fwd_h
-from tops.ops.common.chunk_h import chunk_bwd_dh_ref as chunk_bwd_dh
+from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
+from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
@@ -490,6 +490,8 @@ def chunk_simple_gla_fwd(
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all()
     assert (K % 128 == 0) and (V % 128 == 0)
 
+    interpret = not is_tpu_runtime()
+    
     h, ht = chunk_fwd_h(
         k=k,
         v=v,
@@ -503,6 +505,7 @@ def chunk_simple_gla_fwd(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
+        interpret=interpret,
     )
     o = chunk_fwd_o(
         q=q,
@@ -515,6 +518,7 @@ def chunk_simple_gla_fwd(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
+        interpret=interpret,
     )
     return o, ht
 
@@ -603,6 +607,7 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
+        interpret=interpret,
     )
 
     # Build synthetic gk from g_gamma for kernels that need it
@@ -621,6 +626,7 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
+        interpret=interpret,
     )
 
     # 4. Fused dq/dk/dv via simple GLA pallas kernel
