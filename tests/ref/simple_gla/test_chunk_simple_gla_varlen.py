@@ -2,8 +2,11 @@
 matches independent per-sequence batch execution.
 
 Tests:
-  1. CPU-only: varlen vs independent batch (no GPU needed)
-  2. GPU: CPU ref varlen vs FLA Triton varlen (requires CUDA + FLA)
+  1. CPU-only: varlen forward vs independent batch (no GPU needed)
+  2. CPU-only: varlen forward with initial state h0
+  3. CPU-only: varlen backward vs per-sequence jax.grad(naive) (fp64)
+  4. CPU-only: varlen backward with h0
+  5. GPU: CPU ref varlen vs FLA Triton varlen (requires CUDA + FLA)
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 import jax.numpy as jnp
 import pytest
-from tops.cpu.ops.simple_gla import chunk_simple_gla
+from tops.cpu.ops.simple_gla import chunk_simple_gla, naive_simple_gla
+from tops.cpu.ops.simple_gla.chunk import chunk_simple_gla_bwd
 from tests.utils import compare_tensor
 
 HAS_CUDA = False
@@ -184,7 +188,144 @@ def test_simple_gla_varlen_with_h0():
 
 
 # ============================================================================
-# 3. GPU: CPU ref varlen vs FLA Triton varlen
+# 3. CPU-only: varlen backward vs per-sequence jax.grad(naive) (fp64)
+# ============================================================================
+
+
+@pytest.mark.parametrize("gate", GATE_MODES)
+@pytest.mark.parametrize("cfg", _VARLEN_SHAPES, ids=[_varlen_id(c) for c in _VARLEN_SHAPES])
+def test_simple_gla_varlen_bwd(cfg, gate):
+    """Varlen chunk backward should match per-sequence jax.grad(naive) at fp64.
+
+    This is the varlen counterpart of test_chunk_bwd_vs_autograd_fp64 in
+    test_chunk_simple_gla.py.  Reference gradients are computed by running
+    jax.grad(naive_simple_gla) independently on each sequence, then
+    concatenating.  The chunk backward is run once with cu_seqlens.
+
+    Config 3 (T=100, segs=[30,70], C=64) exercises partial chunks, which is
+    critical for the dg_last placement fix.
+    """
+    T, H, K, V, C, seed = cfg["T"], cfg["H"], cfg["K"], cfg["V"], cfg["C"], cfg["seed"]
+    cu = jnp.array(cfg["cu_seqlens"])
+    N = len(cfg["cu_seqlens"]) - 1
+
+    keys = jax.random.split(jax.random.PRNGKey(seed), 5)
+    q = jax.random.normal(keys[0], (1, T, H, K), dtype=jnp.float64)
+    k = jax.random.normal(keys[1], (1, T, H, K), dtype=jnp.float64)
+    v = jax.random.normal(keys[2], (1, T, H, V), dtype=jnp.float64)
+
+    g = jax.nn.log_sigmoid(
+        jax.random.normal(keys[3], (1, T, H), dtype=jnp.float64)
+    ) if gate == "g" else None
+    g_gamma = -jax.nn.softplus(
+        jax.random.normal(keys[4], (H,), dtype=jnp.float64)
+    ) if gate == "g_gamma" else None
+
+    # Reference: per-sequence jax.grad(naive_simple_gla)
+    ref_dq_parts, ref_dk_parts, ref_dv_parts, ref_dg_parts = [], [], [], []
+    for n in range(N):
+        bos, eos = int(cu[n]), int(cu[n + 1])
+        q_n, k_n, v_n = q[:, bos:eos], k[:, bos:eos], v[:, bos:eos]
+        g_n = g[:, bos:eos] if g is not None else None
+
+        def loss_fn(q_, k_, v_, g_):
+            o, _ = naive_simple_gla(
+                q_, k_, v_, g=g_, g_gamma=g_gamma, output_final_state=False,
+            )
+            return o.sum()
+
+        argnums = [0, 1, 2]
+        if g_n is not None:
+            argnums.append(3)
+        grads = jax.grad(loss_fn, argnums=argnums)(q_n, k_n, v_n, g_n)
+
+        ref_dq_parts.append(grads[0])
+        ref_dk_parts.append(grads[1])
+        ref_dv_parts.append(grads[2])
+        if g_n is not None:
+            ref_dg_parts.append(grads[3])
+
+    ref_dq = jnp.concatenate(ref_dq_parts, axis=1)
+    ref_dk = jnp.concatenate(ref_dk_parts, axis=1)
+    ref_dv = jnp.concatenate(ref_dv_parts, axis=1)
+    ref_dg = jnp.concatenate(ref_dg_parts, axis=1) if ref_dg_parts else None
+
+    # Chunk backward with cu_seqlens
+    scale = K ** -0.5
+    do = jnp.ones((1, T, H, V), dtype=jnp.float64)
+    dq, dk, dv, dg, dh0 = chunk_simple_gla_bwd(
+        q, k, v, g, g_gamma, None, do=do, dht=None, scale=scale,
+        chunk_size=C, cu_seqlens=cu,
+    )
+
+    assert compare_tensor("dq", ref_dq, dq, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    assert compare_tensor("dk", ref_dk, dk, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    assert compare_tensor("dv", ref_dv, dv, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    if g is not None:
+        assert compare_tensor("dg", ref_dg, dg, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    else:
+        assert dg is None
+
+
+# ============================================================================
+# 4. CPU-only: varlen backward with initial state h0
+# ============================================================================
+
+
+def test_simple_gla_varlen_bwd_with_h0():
+    """Varlen backward with h0 should match per-sequence jax.grad(naive)."""
+    H, K, V, C = 2, 32, 64, 64
+    cu = jnp.array([0, 64, 128])
+    N = 2
+
+    keys = jax.random.split(jax.random.PRNGKey(99), 5)
+    q = jax.random.normal(keys[0], (1, 128, H, K), dtype=jnp.float64)
+    k = jax.random.normal(keys[1], (1, 128, H, K), dtype=jnp.float64)
+    v = jax.random.normal(keys[2], (1, 128, H, V), dtype=jnp.float64)
+    g = jax.nn.log_sigmoid(jax.random.normal(keys[3], (1, 128, H), dtype=jnp.float64))
+    h0 = jax.random.normal(keys[4], (N, H, K, V), dtype=jnp.float64)
+
+    # Reference: per-sequence jax.grad(naive) including h0
+    ref_dq_parts, ref_dk_parts, ref_dv_parts, ref_dg_parts = [], [], [], []
+    for n in range(N):
+        bos, eos = int(cu[n]), int(cu[n + 1])
+        q_n, k_n, v_n = q[:, bos:eos], k[:, bos:eos], v[:, bos:eos]
+        g_n = g[:, bos:eos]
+        h0_n = h0[n : n + 1]
+
+        def loss_fn(q_, k_, v_, g_):
+            o, _ = naive_simple_gla(
+                q_, k_, v_, g=g_, initial_state=h0_n, output_final_state=False,
+            )
+            return o.sum()
+
+        grads = jax.grad(loss_fn, argnums=[0, 1, 2, 3])(q_n, k_n, v_n, g_n)
+        ref_dq_parts.append(grads[0])
+        ref_dk_parts.append(grads[1])
+        ref_dv_parts.append(grads[2])
+        ref_dg_parts.append(grads[3])
+
+    ref_dq = jnp.concatenate(ref_dq_parts, axis=1)
+    ref_dk = jnp.concatenate(ref_dk_parts, axis=1)
+    ref_dv = jnp.concatenate(ref_dv_parts, axis=1)
+    ref_dg = jnp.concatenate(ref_dg_parts, axis=1)
+
+    # Chunk backward with cu_seqlens + h0
+    scale = K ** -0.5
+    do = jnp.ones((1, 128, H, V), dtype=jnp.float64)
+    dq, dk, dv, dg, dh0_out = chunk_simple_gla_bwd(
+        q, k, v, g, None, h0, do=do, dht=None, scale=scale,
+        chunk_size=C, cu_seqlens=cu,
+    )
+
+    assert compare_tensor("dq", ref_dq, dq, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    assert compare_tensor("dk", ref_dk, dk, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    assert compare_tensor("dv", ref_dv, dv, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+    assert compare_tensor("dg", ref_dg, dg, atol=1e-8, rtol=1e-8, compare_dtype=np.float64)
+
+
+# ============================================================================
+# 5. GPU: CPU ref varlen vs FLA Triton varlen
 # ============================================================================
 
 
