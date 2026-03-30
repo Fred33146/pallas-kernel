@@ -1,0 +1,40 @@
+# CI GPU Tests via SkyPilot
+# Runs GPU tests: JAX CPU ref vs FLA Triton (simple_gla)
+#
+# Usage (CI - automatic via GitHub Actions):
+#   Triggered by .github/workflows/gpu_tests.yml
+#
+# Usage (manual):
+#   sky launch .github/ci/gpu-tests.sky.yaml --env BRANCH=main -y
+
+resources:
+  accelerators: H100:1
+  use_spot: true
+
+setup: |
+  set -ex
+
+  pip install uv
+
+  git clone -b "${BRANCH:-main}" --depth=1 \
+    https://github.com/primatrix/pallas-kernel.git ~/pallas-kernel
+
+  cd ~/pallas-kernel
+  # Use uv's managed Python 3.12 (VM ships Python 3.10, project requires >=3.12)
+  uv venv --python 3.12 .venv
+  source .venv/bin/activate
+  uv pip install -e '.[gpu]'
+  uv pip install pytest
+
+run: |
+  set -ex
+  cd ~/pallas-kernel
+  source .venv/bin/activate
+
+  # Run only GPU tests: CPU ref vs FLA Triton (simple_gla only)
+  # -k triton skips CPU-only cross-validation tests
+  python -m pytest \
+    -o "addopts=--strict-markers" \
+    tests/ref/simple_gla/ \
+    -k triton \
+    -v

@@ -1,0 +1,55 @@
+name: GPU Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tops/cpu/ops/**'
+      - 'tests/ref/**'
+      - '.github/ci/gpu-tests.sky.yaml'
+      - '.github/workflows/gpu_tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tops/cpu/ops/**'
+      - 'tests/ref/**'
+      - '.github/ci/gpu-tests.sky.yaml'
+      - '.github/workflows/gpu_tests.yml'
+
+concurrency:
+  group: gpu-tests-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  gpu_tests:
+    name: "GPU H100 tests vs Triton"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SkyPilot
+        run: pip install "skypilot-nightly[all]==1.0.0.dev20251017"
+
+      - name: Login to SkyPilot API server
+        run: sky api login --endpoint "${{ secrets.SKYPILOT_API_SERVER_ENDPOINT }}"
+
+      - name: Generate unique cluster name
+        id: cluster
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          NAME="ci-gpu-$(echo "$BRANCH" | tr '/_' '--' | tr '[:upper:]' '[:lower:]' | head -c 30)-${GITHUB_RUN_NUMBER}"
+          NAME=$(echo "$NAME" | head -c 63)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Launch GPU tests
+        run: |
+          sky launch .github/ci/gpu-tests.sky.yaml \
+            --cluster "${{ steps.cluster.outputs.name }}" \
+            --env BRANCH="${{ github.head_ref || github.ref_name }}" \
+            --idle-minutes-to-autostop 5 \
+            -y
+
+      - name: Cleanup
+        if: always()
+        run: sky down "${{ steps.cluster.outputs.name }}" -y || true
