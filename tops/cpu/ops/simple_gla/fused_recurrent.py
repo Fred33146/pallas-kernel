@@ -19,6 +19,7 @@ Dtype contract (matching FLA fused_recurrent for bf16/fp16/fp32; all fp64 for fp
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -32,17 +33,17 @@ def _acc_dtype(input_dtype) -> jnp.dtype:
 
 @cpu_reference
 def fused_recurrent_simple_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    g: jnp.ndarray | None = None,
-    g_gamma: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: np.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Fused recurrent Simple GLA — JAX CPU reference with FLA-exact dtype behavior.
 
     Simple GLA recurrence (per timestep):

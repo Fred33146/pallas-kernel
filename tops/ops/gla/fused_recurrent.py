@@ -15,15 +15,15 @@ from tops.utils import cdiv, align_up, pad_to_multiple
 
 
 def fused_recurrent_gla_fwd_ref(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    g: jnp.ndarray | None = None,
-    g_gamma: jnp.ndarray | None = None,
-    gk: jnp.ndarray | None = None,
-    gv: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    gk: jax.Array | None = None,
+    gv: jax.Array | None = None,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: np.ndarray | None = None,

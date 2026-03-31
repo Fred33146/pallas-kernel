@@ -29,6 +29,7 @@ Dtype contract (matching FLA Triton for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -49,12 +50,12 @@ from tops.cpu.ops.common.chunk_o import chunk_local_cumsum
 
 
 def chunk_gla_fwd_intra_gk(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  g: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  g: jax.Array,
   scale: float,
   chunk_size: int = 64,
-) -> jnp.ndarray:
+) -> jax.Array:
   """Intra-chunk attention matrix.
 
   FLA Triton: g_cumsum is fp32, so q*exp(g) and k*exp(-g) are fp32
@@ -97,14 +98,14 @@ def chunk_gla_fwd_intra_gk(
 
 
 def chunk_gla_fwd_o_gk(
-  q: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray,
-  A: jnp.ndarray,
-  h: jnp.ndarray,
+  q: jax.Array,
+  v: jax.Array,
+  g: jax.Array,
+  A: jax.Array,
+  h: jax.Array,
   scale: float,
   chunk_size: int = 64,
-) -> jnp.ndarray:
+) -> jax.Array:
   """Combine inter-chunk and intra-chunk to produce output.
 
   FLA Triton dtype behavior:
@@ -156,17 +157,17 @@ def chunk_gla_fwd_o_gk(
 
 
 def chunk_gla_fwd(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray,
-  g_cumsum: jnp.ndarray | None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array,
+  g_cumsum: jax.Array | None,
   scale: float,
-  initial_state: jnp.ndarray | None,
+  initial_state: jax.Array | None,
   output_final_state: bool,
   chunk_size: int = 64,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, jnp.ndarray]:
+  cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None, jax.Array]:
   """Chunk GLA forward orchestrator. No blanket dtype upcast.
 
   Returns:
@@ -274,11 +275,11 @@ def chunk_gla_fwd(
 
 
 def chunk_gla_bwd_dA(
-  v: jnp.ndarray,
-  do: jnp.ndarray,
+  v: jax.Array,
+  do: jax.Array,
   scale: float,
   chunk_size: int = 64,
-) -> jnp.ndarray:
+) -> jax.Array:
   """Gradient of intra-chunk attention matrix.
 
   FLA Triton: dA output in fp32. Matmul accumulates in fp32.
@@ -307,13 +308,13 @@ def chunk_gla_bwd_dA(
 
 
 def chunk_gla_bwd_dv(
-  k: jnp.ndarray,
-  g_cumsum: jnp.ndarray,
-  A: jnp.ndarray,
-  do: jnp.ndarray,
-  dh: jnp.ndarray,
+  k: jax.Array,
+  g_cumsum: jax.Array,
+  A: jax.Array,
+  do: jax.Array,
+  dh: jax.Array,
   chunk_size: int = 64,
-) -> jnp.ndarray:
+) -> jax.Array:
   """Gradient of v.
 
   FLA Triton dtype:
@@ -354,12 +355,12 @@ def chunk_gla_bwd_dv(
 
 
 def chunk_gla_bwd_dqk_intra(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  g_cumsum: jnp.ndarray,
-  dA: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  g_cumsum: jax.Array,
+  dA: jax.Array,
   chunk_size: int = 64,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jax.Array, jax.Array]:
   """Intra-chunk dq, dk from dA.
 
   FLA Triton: k, gk explicitly cast to fp32. dq, dk output in fp32.
@@ -393,18 +394,18 @@ def chunk_gla_bwd_dqk_intra(
 
 
 def chunk_gla_bwd_dqkg(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  h: jnp.ndarray,
-  g_cumsum: jnp.ndarray,
-  do: jnp.ndarray,
-  dh: jnp.ndarray,
-  dq: jnp.ndarray,
-  dk: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  h: jax.Array,
+  g_cumsum: jax.Array,
+  do: jax.Array,
+  dh: jax.Array,
+  dq: jax.Array,
+  dk: jax.Array,
   scale: float,
   chunk_size: int = 64,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Inter-chunk dq, dk + gate gradient dg.
 
   FLA Triton dtype:
@@ -466,20 +467,20 @@ def chunk_gla_bwd_dqkg(
 
 
 def chunk_gla_bwd(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray,
-  g_cumsum: jnp.ndarray | None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array,
+  g_cumsum: jax.Array | None,
   scale: float,
-  initial_state: jnp.ndarray | None,
-  h: jnp.ndarray | None,
-  A: jnp.ndarray | None,
-  do: jnp.ndarray,
-  dht: jnp.ndarray | None,
+  initial_state: jax.Array | None,
+  h: jax.Array | None,
+  A: jax.Array | None,
+  do: jax.Array,
+  dht: jax.Array | None,
   chunk_size: int = 64,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
+  cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
   """Chunk GLA backward orchestrator.
 
   FLA Triton:
@@ -646,16 +647,16 @@ def chunk_gla_bwd(
 
 @cpu_reference
 def chunk_gla(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray | None = None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array | None = None,
   scale: float | None = None,
-  initial_state: jnp.ndarray | None = None,
+  initial_state: jax.Array | None = None,
   output_final_state: bool = False,
-  cu_seqlens: jnp.ndarray | None = None,
+  cu_seqlens: jax.Array | None = None,
   chunk_size: int = 16,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
   """Chunk GLA with FLA-triton-exact dtype behavior.
 
   No blanket upcast — inputs stay in their original dtype.

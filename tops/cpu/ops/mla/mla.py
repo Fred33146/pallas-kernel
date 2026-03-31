@@ -25,6 +25,7 @@ Reference:
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -41,10 +42,10 @@ def _acc_dtype(input_dtype) -> jnp.dtype:
 
 
 def rms_norm(
-    x: jnp.ndarray,
-    weight: jnp.ndarray,
+    x: jax.Array,
+    weight: jax.Array,
     eps: float = 1e-6,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Functional RMSNorm — fp32 internal computation, cast back to input dtype.
 
     Matches FLA's RMSNorm(dtype=torch.float32) used in MLA projection paths.
@@ -85,7 +86,7 @@ def precompute_freqs_cis(
     dim: int,
     max_seq_len: int,
     theta: float = 10000.0,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jax.Array, jax.Array]:
     """Precompute RoPE cos/sin frequency tables.
 
     Matches FLA's RotaryEmbedding._update_cos_sin_cache() — position indices
@@ -117,10 +118,10 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(
-    x: jnp.ndarray,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray,
-) -> jnp.ndarray:
+    x: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+) -> jax.Array:
     """Apply rotary position embedding (non-interleaved / GPT-NeoX style).
 
     Matches FLA's rotary_embedding_ref() with interleaved=False:
@@ -164,17 +165,17 @@ def apply_rotary_emb(
 
 
 def mla_project_q(
-    hidden: jnp.ndarray,
-    w_dq: jnp.ndarray,
-    w_uq: jnp.ndarray,
-    q_norm_weight: jnp.ndarray,
+    hidden: jax.Array,
+    w_dq: jax.Array,
+    w_uq: jax.Array,
+    q_norm_weight: jax.Array,
     num_heads: int,
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray,
+    cos: jax.Array,
+    sin: jax.Array,
     eps: float = 1e-6,
-) -> jnp.ndarray:
+) -> jax.Array:
     """MLA Query projection: LoRA compress -> RMSNorm(fp32) -> expand -> split -> RoPE.
 
     Matches FLA's q_proj = nn.Sequential(
@@ -252,19 +253,19 @@ def mla_project_q(
 
 
 def mla_project_kv(
-    hidden: jnp.ndarray,
-    w_dkv: jnp.ndarray,
-    w_ukv: jnp.ndarray,
-    kv_norm_weight: jnp.ndarray,
-    w_kr: jnp.ndarray,
+    hidden: jax.Array,
+    w_dkv: jax.Array,
+    w_ukv: jax.Array,
+    kv_norm_weight: jax.Array,
+    w_kr: jax.Array,
     num_heads: int,
     qk_nope_head_dim: int,
     v_head_dim: int,
     qk_rope_head_dim: int,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray,
+    cos: jax.Array,
+    sin: jax.Array,
     eps: float = 1e-6,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jax.Array, jax.Array]:
     """MLA KV projection: LoRA compress -> RMSNorm(fp32) -> expand/split + separate RoPE key.
 
     Matches FLA's kv_proj = nn.Sequential(
@@ -359,11 +360,11 @@ def mla_project_kv(
 
 
 def causal_softmax_attention(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
     scale: float | None = None,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Standard causal softmax attention — reference implementation.
 
     Computes: o = softmax(q @ k^T * scale + causal_mask) @ v
@@ -442,23 +443,23 @@ def causal_softmax_attention(
 
 @cpu_reference
 def mla_forward(
-    hidden: jnp.ndarray,
-    w_dq: jnp.ndarray,
-    w_uq: jnp.ndarray,
-    q_norm_weight: jnp.ndarray,
-    w_dkv: jnp.ndarray,
-    w_ukv: jnp.ndarray,
-    kv_norm_weight: jnp.ndarray,
-    w_kr: jnp.ndarray,
-    w_o: jnp.ndarray,
+    hidden: jax.Array,
+    w_dq: jax.Array,
+    w_uq: jax.Array,
+    q_norm_weight: jax.Array,
+    w_dkv: jax.Array,
+    w_ukv: jax.Array,
+    kv_norm_weight: jax.Array,
+    w_kr: jax.Array,
+    w_o: jax.Array,
     num_heads: int,
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray,
+    cos: jax.Array,
+    sin: jax.Array,
     eps: float = 1e-6,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Full MLA forward pass: project Q/K/V -> causal attention -> output projection.
 
     Orchestrates all MLA sub-functions to compute the complete forward pass.

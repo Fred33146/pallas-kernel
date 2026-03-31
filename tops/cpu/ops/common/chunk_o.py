@@ -8,6 +8,7 @@ chunk_fwd_o: fused inter+intra output computation for Simple GLA (scalar g / g_g
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops.common.utils import acc_dtype, cdiv, dot, pad_to_multiple, read_chunk, write_chunk
@@ -15,11 +16,11 @@ from tops.utils import prepare_chunk_indices
 
 
 def chunk_local_cumsum(
-  g: jnp.ndarray,
+  g: jax.Array,
   chunk_size: int,
   reverse: bool = False,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> jnp.ndarray:
+  cu_seqlens: jax.Array | None = None,
+) -> jax.Array:
   """Chunk-local cumulative sum of gates.
 
   Works for both 3D [B,T,H] (Simple GLA scalar gates) and 4D [B,T,H,K]
@@ -112,17 +113,17 @@ def chunk_local_cumsum(
 
 
 def chunk_fwd_o(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  h: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  h: jax.Array,
   *,
-  g: jnp.ndarray | None = None,
-  g_gamma: jnp.ndarray | None = None,
+  g: jax.Array | None = None,
+  g_gamma: jax.Array | None = None,
   scale: float = 1.0,
   chunk_size: int = 64,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> jnp.ndarray:
+  cu_seqlens: jax.Array | None = None,
+) -> jax.Array:
   """Fused inter-chunk + intra-chunk output computation (Simple GLA).
 
   Matches FLA chunk_fwd_kernel_o with USE_G and USE_G_GAMMA.

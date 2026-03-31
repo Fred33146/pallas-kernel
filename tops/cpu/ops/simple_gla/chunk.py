@@ -31,6 +31,7 @@ Dtype contract (matching FLA Triton for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -51,17 +52,17 @@ from tops.cpu.ops.common.chunk_o import chunk_fwd_o, chunk_local_cumsum
 
 @cpu_reference
 def chunk_simple_gla_fwd(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray | None,
-  g_gamma: jnp.ndarray | None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array | None,
+  g_gamma: jax.Array | None,
   scale: float,
-  initial_state: jnp.ndarray | None,
+  initial_state: jax.Array | None,
   output_final_state: bool,
   chunk_size: int = 64,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+  cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
   """Chunk Simple GLA forward orchestrator. No blanket dtype upcast.
 
   Orchestrates the chunk-based forward pass:
@@ -134,19 +135,19 @@ def chunk_simple_gla_fwd(
 
 
 def chunk_bwd_dqkwg(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  h: jnp.ndarray,
-  dh: jnp.ndarray,
-  do: jnp.ndarray,
-  g: jnp.ndarray | None = None,
-  g_gamma: jnp.ndarray | None = None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  h: jax.Array,
+  dh: jax.Array,
+  do: jax.Array,
+  g: jax.Array | None = None,
+  g_gamma: jax.Array | None = None,
   scale: float = 1.0,
   chunk_size: int = 64,
   original_T: int | None = None,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
+  cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
   """Backward gradients for q, k, and g (Simple GLA).
 
   Phase 1: V-loop computes b_ds, b_dq, b_dk (and b_dg_last for USE_G).
@@ -473,17 +474,17 @@ def chunk_bwd_dqkwg(
 
 
 def chunk_bwd_dv(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  do: jnp.ndarray,
-  dh: jnp.ndarray,
-  g: jnp.ndarray | None = None,
-  g_gamma: jnp.ndarray | None = None,
+  q: jax.Array,
+  k: jax.Array,
+  do: jax.Array,
+  dh: jax.Array,
+  g: jax.Array | None = None,
+  g_gamma: jax.Array | None = None,
   scale: float = 1.0,
   chunk_size: int = 64,
   original_T: int | None = None,
-  cu_seqlens: jnp.ndarray | None = None,
-) -> jnp.ndarray:
+  cu_seqlens: jax.Array | None = None,
+) -> jax.Array:
   """Backward gradient for v (Simple GLA).
 
   Uses if g / elif g_gamma (mutually exclusive) for gate application.
@@ -666,19 +667,19 @@ def chunk_bwd_dv(
 
 @cpu_reference
 def chunk_simple_gla_bwd(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray | None,
-  g_gamma: jnp.ndarray | None,
-  initial_state: jnp.ndarray | None,
-  do: jnp.ndarray,
-  dht: jnp.ndarray | None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array | None,
+  g_gamma: jax.Array | None,
+  initial_state: jax.Array | None,
+  do: jax.Array,
+  dht: jax.Array | None,
   scale: float,
   chunk_size: int = 64,
-  cu_seqlens: jnp.ndarray | None = None,
+  cu_seqlens: jax.Array | None = None,
 ) -> tuple[
-  jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, jnp.ndarray | None
+  jax.Array, jax.Array, jax.Array, jax.Array | None, jax.Array | None
 ]:
   """Chunk Simple GLA backward orchestrator.
 
@@ -794,17 +795,17 @@ def chunk_simple_gla_bwd(
 
 @cpu_reference
 def chunk_simple_gla(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray | None = None,
-  g_gamma: jnp.ndarray | None = None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array | None = None,
+  g_gamma: jax.Array | None = None,
   scale: float | None = None,
-  initial_state: jnp.ndarray | None = None,
+  initial_state: jax.Array | None = None,
   output_final_state: bool = False,
-  cu_seqlens: jnp.ndarray | None = None,
+  cu_seqlens: jax.Array | None = None,
   chunk_size: int = 64,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
   """Chunk Simple GLA with FLA-triton-exact dtype behavior.
 
   No blanket upcast -- inputs stay in their original dtype.

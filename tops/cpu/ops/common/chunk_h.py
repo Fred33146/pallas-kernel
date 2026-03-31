@@ -22,25 +22,26 @@ Gate flags (matching FLA Triton constexpr parameters):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops.common.utils import acc_dtype, cdiv, dot, read_chunk
 
 
 def chunk_fwd_h(
-    k: jnp.ndarray,
-    v: jnp.ndarray,
+    k: jax.Array,
+    v: jax.Array,
     *,
-    g: jnp.ndarray | None = None,
-    g_gamma: jnp.ndarray | None = None,
-    gk: jnp.ndarray | None = None,
-    h0: jnp.ndarray | None = None,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    gk: jax.Array | None = None,
+    h0: jax.Array | None = None,
     output_final_state: bool = False,
     states_in_fp32: bool = False,
     chunk_size: int = 64,
     original_T: int | None = None,
-    cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
     """Inter-chunk hidden state propagation (shared GLA / Simple GLA).
 
     Processes chunks sequentially, propagating hidden state h through
@@ -226,19 +227,19 @@ def chunk_fwd_h(
 
 
 def chunk_bwd_dh(
-    q: jnp.ndarray,
-    do: jnp.ndarray,
+    q: jax.Array,
+    do: jax.Array,
     *,
-    g: jnp.ndarray | None = None,
-    g_gamma: jnp.ndarray | None = None,
-    gk: jnp.ndarray | None = None,
-    h0: jnp.ndarray | None = None,
-    dht: jnp.ndarray | None = None,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    gk: jax.Array | None = None,
+    h0: jax.Array | None = None,
+    dht: jax.Array | None = None,
     scale: float = 1.0,
     chunk_size: int = 64,
     original_T: int | None = None,
-    cu_seqlens: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    cu_seqlens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
     """Backward hidden state gradient propagation (shared GLA / Simple GLA).
 
     Reverse iteration through chunks. Matches FLA chunk_bwd_kernel_dh.

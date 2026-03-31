@@ -26,6 +26,7 @@ Dtype contract (matching FLA for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -36,16 +37,16 @@ from tops.cpu.ops.common.utils import pad_to_multiple as _pad_to_multiple
 
 @cpu_reference
 def chunk_kda(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray,
-  beta: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array,
+  beta: jax.Array,
   scale: float | None = None,
-  initial_state: jnp.ndarray | None = None,
+  initial_state: jax.Array | None = None,
   output_final_state: bool = False,
   chunk_size: int = 64,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
   """Chunk KDA with FLA-exact dtype behavior.
 
   Processes the sequence in chunks of size `chunk_size`, solving the

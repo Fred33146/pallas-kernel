@@ -32,7 +32,7 @@ ACT2FN = {
 }
 
 
-def _rearrange_to_heads(x: jnp.ndarray, head_dim: int) -> jnp.ndarray:
+def _rearrange_to_heads(x: jax.Array, head_dim: int) -> jax.Array:
     """Reshape: ... (h d) -> ... h d"""
     *leading, last = x.shape
     assert last % head_dim == 0
@@ -40,13 +40,13 @@ def _rearrange_to_heads(x: jnp.ndarray, head_dim: int) -> jnp.ndarray:
     return x.reshape(*leading, num_heads, head_dim)
 
 
-def _rearrange_from_heads(x: jnp.ndarray) -> jnp.ndarray:
+def _rearrange_from_heads(x: jax.Array) -> jax.Array:
     """Reshape: ... h d -> ... (h d)"""
     *leading, h, d = x.shape
     return x.reshape(*leading, h * d)
 
 
-def _repeat_kv(x: jnp.ndarray, num_groups: int, head_dim: int) -> jnp.ndarray:
+def _repeat_kv(x: jax.Array, num_groups: int, head_dim: int) -> jax.Array:
     """repeat(x, '... (h d) -> ... (h g) d', g=num_groups, d=head_dim).
 
     Input: ... (h d)  where h = num_kv_heads
@@ -207,13 +207,13 @@ class GatedLinearAttention(nnx.Module):
 
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray | None = None,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array | None = None,
         past_key_values: Any | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
         **kwargs,
-    ) -> tuple[jnp.ndarray, None, Any | None]:
+    ) -> tuple[jax.Array, None, Any | None]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len]."

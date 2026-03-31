@@ -23,6 +23,7 @@ Dtype contract (matching FLA for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -31,15 +32,15 @@ from tops.cpu.ops.common import acc_dtype as _acc_dtype
 
 @cpu_reference
 def naive_kda(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray,
-  beta: jnp.ndarray,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array,
+  beta: jax.Array,
   scale: float | None = None,
-  initial_state: jnp.ndarray | None = None,
+  initial_state: jax.Array | None = None,
   output_final_state: bool = False,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
   """Naive recurrent KDA — JAX CPU reference with FLA-exact dtype behavior.
 
   KDA (Kernel Delta Attention) implements a gated delta rule where the

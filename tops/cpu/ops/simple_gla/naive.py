@@ -28,15 +28,15 @@ from tops.cpu.ops.common import acc_dtype as _acc_dtype
 
 @cpu_reference
 def naive_simple_gla(
-  q: jnp.ndarray,
-  k: jnp.ndarray,
-  v: jnp.ndarray,
-  g: jnp.ndarray | None = None,
-  g_gamma: jnp.ndarray | None = None,
+  q: jax.Array,
+  k: jax.Array,
+  v: jax.Array,
+  g: jax.Array | None = None,
+  g_gamma: jax.Array | None = None,
   scale: float | None = None,
-  initial_state: jnp.ndarray | None = None,
+  initial_state: jax.Array | None = None,
   output_final_state: bool = False,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
   """Naive recurrent Simple GLA — JAX CPU reference with FLA-exact dtype behavior.
 
   Simple GLA uses per-head scalar gates (g: [B,T,H]) instead of per-element

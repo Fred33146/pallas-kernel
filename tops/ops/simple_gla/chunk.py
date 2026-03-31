@@ -639,7 +639,7 @@ def chunk_simple_gla_bwd(
 
     return dq, dk, dv, dh0
 
-def _pad_axis(x: jnp.ndarray, multiple: int, axis: int) -> jnp.ndarray:
+def _pad_axis(x: jax.Array, multiple: int, axis: int) -> jax.Array:
     """Zero-pad tensor along *axis* so its size is a multiple of *multiple*."""
     rem = x.shape[axis] % multiple
     if rem == 0:
@@ -743,15 +743,15 @@ def _pallas_chunk_gla_bwd(
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
 def chunk_simple_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    g_gamma: jnp.ndarray,
-    initial_state: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g_gamma: jax.Array,
+    initial_state: jax.Array | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Chunked Simple GLA using pallas-kernel's Pallas TPU kernels.
 
     Args:

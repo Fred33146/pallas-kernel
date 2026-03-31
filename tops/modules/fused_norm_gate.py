@@ -25,7 +25,7 @@ class FusedRMSNormGated(nnx.Module):
         else:
             self.weight = None
 
-    def __call__(self, x: jnp.ndarray, g: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jax.Array, g: jax.Array) -> jax.Array:
         input_dtype = x.dtype
         x = x.astype(jnp.float32)
         g = g.astype(jnp.float32)

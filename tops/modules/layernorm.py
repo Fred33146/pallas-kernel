@@ -25,7 +25,7 @@ class RMSNorm(nnx.Module):
         else:
             self.weight = None
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jax.Array) -> jax.Array:
         input_dtype = x.dtype
         x = x.astype(jnp.float32)
         rms = jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)

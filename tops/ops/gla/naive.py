@@ -1,17 +1,18 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 
 def naive_recurrent_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    gk: jnp.ndarray,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    gk: jax.Array,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     cu_seqlens: np.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Naive recurrent GLA — Pure JAX implementation.
 
     Mathematically equivalent to chunk_gla / fused_recurrent_gla / fused_chunk_gla,

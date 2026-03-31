@@ -15,6 +15,7 @@ Dtype contract (matching FLA for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from tops.cpu.ops import cpu_reference
@@ -27,13 +28,13 @@ def _acc_dtype(input_dtype) -> jnp.dtype:
 
 @cpu_reference
 def naive_recurrent_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    gk: jnp.ndarray,
-    initial_state: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    gk: jax.Array,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Naive recurrent GLA — JAX CPU reference with FLA-exact dtype behavior.
 
     Core recurrence (per timestep):

@@ -36,16 +36,16 @@ class ShortConvolution(nnx.Module):
             rngs=rngs,
         )
 
-    def _apply_activation(self, x: jnp.ndarray) -> jnp.ndarray:
+    def _apply_activation(self, x: jax.Array) -> jax.Array:
         if self.activation in ("silu", "swish"):
             return jax.nn.silu(x)
         return x
 
     def _causal_conv1d(
         self,
-        x: jnp.ndarray,
+        x: jax.Array,
         cu_seqlens=None,
-    ) -> jnp.ndarray:
+    ) -> jax.Array:
         """Apply causal conv1d.
         x: [B, T, D] -> [B, T, D]  (depthwise causal convolution + optional SiLU)
         """
@@ -74,11 +74,11 @@ class ShortConvolution(nnx.Module):
 
     def step(
         self,
-        x: jnp.ndarray,
-        cache: jnp.ndarray | None,
+        x: jax.Array,
+        cache: jax.Array | None,
         output_final_state: bool = False,
         cu_seqlens=None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    ) -> tuple[jax.Array, jax.Array | None]:
         """Single-step decoding with cache update.
 
         x: [B, 1, D] or [1, N, D] with cu_seqlens
@@ -120,12 +120,12 @@ class ShortConvolution(nnx.Module):
 
     def __call__(
         self,
-        x: jnp.ndarray,
-        cache: jnp.ndarray | None = None,
+        x: jax.Array,
+        cache: jax.Array | None = None,
         output_final_state: bool = False,
         cu_seqlens=None,
         **kwargs,
-    ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    ) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass.
 
         Args:

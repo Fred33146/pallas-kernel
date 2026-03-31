@@ -30,6 +30,7 @@ Dtype contract (matching FLA Triton for bf16/fp16/fp32; all fp64 for fp64):
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -48,17 +49,17 @@ def _acc_dtype(input_dtype) -> jnp.dtype:
 
 @cpu_reference
 def fused_recurrent_fwd(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    gk: jnp.ndarray | None = None,
-    gv: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    gk: jax.Array | None = None,
+    gv: jax.Array | None = None,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: np.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Forward pass for fused recurrent GLA — FLA-exact dtype behavior.
 
     Recurrence per timestep (gate applied before outer product):
@@ -168,20 +169,20 @@ def fused_recurrent_fwd(
 
 @cpu_reference
 def fused_recurrent_bwd(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    gk: jnp.ndarray | None = None,
-    gv: jnp.ndarray | None = None,
-    o: jnp.ndarray | None = None,
-    do: jnp.ndarray | None = None,
-    dht: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    gk: jax.Array | None = None,
+    gv: jax.Array | None = None,
+    o: jax.Array | None = None,
+    do: jax.Array | None = None,
+    dht: jax.Array | None = None,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     reverse: bool = False,
     cu_seqlens: np.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
-           jnp.ndarray | None, jnp.ndarray | None, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array, jax.Array,
+           jax.Array | None, jax.Array | None, jax.Array | None]:
     """Backward pass for fused recurrent GLA — FLA-exact dtype behavior.
 
     Two-pass algorithm matching fused_recurrent_bwd_kernel:
@@ -359,17 +360,17 @@ def fused_recurrent_bwd(
 
 @cpu_reference
 def fused_recurrent_gla(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    gk: jnp.ndarray | None = None,
-    gv: jnp.ndarray | None = None,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    gk: jax.Array | None = None,
+    gv: jax.Array | None = None,
     scale: float | None = None,
-    initial_state: jnp.ndarray | None = None,
+    initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: np.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+) -> tuple[jax.Array, jax.Array | None]:
     """Fused recurrent GLA — public API matching FLA signature.
 
     Wraps fused_recurrent_fwd, casting output to q.dtype (mirrors

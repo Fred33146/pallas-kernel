@@ -12,7 +12,7 @@ def cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def pad_to_multiple(x: jnp.ndarray, multiple: int, axis: int) -> jnp.ndarray:
+def pad_to_multiple(x: jax.Array, multiple: int, axis: int) -> jax.Array:
     """Zero-pad array along the given axis so its length becomes a multiple of `multiple`.
 
     Args:
@@ -34,11 +34,11 @@ def pad_to_multiple(x: jnp.ndarray, multiple: int, axis: int) -> jnp.ndarray:
 
 
 def gather_chunks(
-    tensor: jnp.ndarray,
-    cu_seqlens: jnp.ndarray,
-    chunk_indices: jnp.ndarray,
+    tensor: jax.Array,
+    cu_seqlens: jax.Array,
+    chunk_indices: jax.Array,
     chunk_size: int,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jax.Array, jax.Array]:
     """Read all chunks from a packed tensor into chunked layout.
 
     Uses vmap(dynamic_slice) for jit-friendly static-shape extraction.
@@ -86,13 +86,13 @@ def gather_chunks(
 
 
 def scatter_chunks(
-    output_buf: jnp.ndarray,
-    chunks: jnp.ndarray,
-    cu_seqlens: jnp.ndarray,
-    chunk_indices: jnp.ndarray,
+    output_buf: jax.Array,
+    chunks: jax.Array,
+    cu_seqlens: jax.Array,
+    chunk_indices: jax.Array,
     chunk_size: int,
-    valid_lens: jnp.ndarray,
-) -> jnp.ndarray:
+    valid_lens: jax.Array,
+) -> jax.Array:
     """Write chunks from chunked layout back to packed tensor.
 
     Uses lax.scan with dynamic_update_slice. Only writes valid positions.
@@ -140,11 +140,11 @@ def scatter_chunks(
 
 
 def read_chunk(
-    tensor: jnp.ndarray,
+    tensor: jax.Array,
     start: int,
     valid_len: int,
     chunk_size: int,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Read a single chunk from a packed tensor, zero-padding past valid_len.
 
     Args:
@@ -167,11 +167,11 @@ def read_chunk(
 
 
 def write_chunk(
-    buf: jnp.ndarray,
-    chunk: jnp.ndarray,
+    buf: jax.Array,
+    chunk: jax.Array,
     start: int,
     valid_len: int,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Write valid positions of a chunk into the output buffer.
 
     Args:
@@ -191,7 +191,7 @@ def acc_dtype(input_dtype) -> jnp.dtype:
     return jnp.float64 if input_dtype == jnp.float64 else jnp.float32
 
 
-def dot(subscripts: str, a: jnp.ndarray, b: jnp.ndarray, acc: jnp.dtype) -> jnp.ndarray:
+def dot(subscripts: str, a: jax.Array, b: jax.Array, acc: jnp.dtype) -> jax.Array:
     """Einsum simulating Triton's tl.dot with fp32 accumulation.
 
     XLA CPU's DotThunk does not support bf16×bf16→fp32 for certain einsum
