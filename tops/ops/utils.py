@@ -1,3 +1,5 @@
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -22,3 +24,14 @@ def is_tpu_runtime() -> bool:
     except Exception:
         _IS_TPU_RUNTIME_CACHED = jax.default_backend() == "tpu"
     return _IS_TPU_RUNTIME_CACHED
+
+
+def get_interpret() -> bool:
+    """Determine the ``interpret`` flag for ``pallas_call``.
+
+    Reads the environment variable ``PALLAS_INTERPRET``.  When set to
+    ``"1"`` or ``"true"`` (case-insensitive) interpret mode is enabled;
+    every other value (including unset) disables it.
+    """
+    env = os.environ.get("PALLAS_INTERPRET", "")
+    return env.strip().lower() in ("1", "true")

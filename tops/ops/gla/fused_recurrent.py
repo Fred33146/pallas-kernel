@@ -6,6 +6,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tops.ops.utils import get_interpret
 from tops.utils import cdiv, align_up, pad_to_multiple
 
 
@@ -358,7 +359,7 @@ def _fused_recurrent_gla_fwd(
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
         ),
-
+        interpret=get_interpret(),
     )(q_trans, k_trans, v_trans, gk_trans, gv_trans, h0_trans, cu_seqlens)
     o, ht = results
     o = o.transpose(0, 2, 3, 1, 4)  # [NK, H, N, T, V] -> [NK, N, T, H, V]
@@ -758,6 +759,7 @@ def _fused_recurrent_gla_bwd(
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
         ),
+        interpret=get_interpret(),
     )(
         q_trans, k_trans, v_trans, gk_trans, gv_trans, h0_trans,
         do_trans, dht_trans, cu_seqlens,

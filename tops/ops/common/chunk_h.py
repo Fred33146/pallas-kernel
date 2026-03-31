@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-from tops.ops.utils import exp
+from tops.ops.utils import exp, get_interpret
 from tops.utils import assert_shape, assert_shape_or_none, export_public
 
 
@@ -103,7 +103,6 @@ def check_chunk_fwd(x):
         "chunk_size",
         "split_size",
         "states_in_fp32",
-        "interpret",
     ],
 )
 def chunk_fwd_h_kernel(
@@ -121,7 +120,6 @@ def chunk_fwd_h_kernel(
     chunk_size: int = 64,
     split_size: int | None = None,
     states_in_fp32: bool = False,
-    interpret: bool = False,
 ):
     # todo: tune bk and bv for bast performance
     BK = 128
@@ -240,6 +238,7 @@ def chunk_fwd_h_kernel(
         BS=BS,
         NT=NT,
     )
+    interpret = get_interpret()
     h, ht = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -373,7 +372,6 @@ def chunk_fwd_h_ref(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
-    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Inter-chunk hidden state propagation.
 
@@ -589,7 +587,6 @@ def chunk_bwd_dh_ref(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
-    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Backward hidden state gradient propagation.
 
@@ -785,7 +782,6 @@ def _chunk_bwd_dh_kernel(
         "output_dh0",
         "chunk_size",
         "states_in_fp32",
-        "interpret",
     ],
 )
 def chunk_bwd_dh_kernel(
@@ -802,7 +798,6 @@ def chunk_bwd_dh_kernel(
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 128,
     states_in_fp32: bool = False,
-    interpret: bool = False,
 ):
     BK, BV, BT = 128, 128, chunk_size
     B, T, H, K = q.shape
@@ -862,6 +857,7 @@ def chunk_bwd_dh_kernel(
 
     kernel = functools.partial(_chunk_bwd_dh_kernel, BT=BT, NT=NT, scale=scale)
 
+    interpret = get_interpret()
     dh_all, dh0 = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(

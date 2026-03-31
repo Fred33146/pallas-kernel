@@ -13,7 +13,7 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import dslice
 from jax.experimental.pallas import tpu as pltpu
 
-from tops.ops.utils import is_tpu_runtime
+from tops.ops.utils import get_interpret
 from tops.utils import export_public, prepare_chunk_indices
 
 _TRIU_PRECISION = jax.lax.Precision.HIGHEST
@@ -391,7 +391,7 @@ def _chunk_local_cumsum_pallas(
   HAS_SCALE = scale is not None
   scale_val = scale if scale is not None else 1.0
 
-  interpret = not is_tpu_runtime()
+  interpret = get_interpret()
 
   # Pad S dimension to multiple of BS
   pad_S = (BS - (S % BS)) % BS

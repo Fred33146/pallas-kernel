@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-from tops.ops.utils import exp, is_tpu_runtime
+from tops.ops.utils import exp, get_interpret
 from tops.utils import assert_shape, assert_shape_or_none
 
 def _chunk_fwd_o_kernel(
@@ -87,7 +87,7 @@ def _chunk_fwd_o_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("chunk_size", "interpret"),
+    static_argnames=("chunk_size",),
 )
 def _chunk_fwd_o_pl(
     q: jax.Array,
@@ -99,7 +99,6 @@ def _chunk_fwd_o_pl(
     g_gamma: jax.Array | None = None,
     scale: float,
     chunk_size: int = 64,
-    interpret: bool = False,
 ) -> jax.Array:
     """Pallas launcher for chunk_fwd_o on the uniform-length path.
 
@@ -144,6 +143,7 @@ def _chunk_fwd_o_pl(
     spec_v = pl.BlockSpec((1, 1, BT, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
     spec_h = pl.BlockSpec((1, 1, K, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
     spec_g = None if _g is None else pl.BlockSpec((1, 1, BT), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0))
+    interpret = get_interpret()
     spec_gamma = None if g_gamma is None else pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
     spec_scale = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
@@ -286,7 +286,6 @@ def chunk_simple_gla_bwd_o_pl(
     chunk_size: int,
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
-    interpret: bool = False,
 ):
     """Launcher for the fused simple GLA backward kernel.
 
@@ -317,6 +316,7 @@ def chunk_simple_gla_bwd_o_pl(
     spec_K = pl.BlockSpec([1, 1, BT, K], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_V = pl.BlockSpec([1, 1, BT, V], index_map=lambda h, nt: (h, nt, 0, 0))
     spec_h = pl.BlockSpec([1, 1, K, V], index_map=lambda h, nt: (h, nt, 0, 0))
+    interpret = get_interpret()
     spec_gamma = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
     dq_shape = jax.ShapeDtypeStruct([H, total_NT, BT, K], q.dtype)
@@ -454,7 +454,6 @@ def chunk_fwd_o(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
-    interpret: bool = False,
 ) -> jax.Array:
     """Chunk forward output computation.
 
@@ -491,7 +490,6 @@ def chunk_fwd_o(
         g_gamma=g_gamma,
         scale=scale,
         chunk_size=chunk_size,
-        interpret=interpret or (not is_tpu_runtime()),
     )
 
 

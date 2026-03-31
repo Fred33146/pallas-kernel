@@ -165,8 +165,7 @@ def _run_jax_chunk(q, k, v, *, g_gamma=None, h0=None, scale=None,
     g_gamma_j = _torch_to_jax(g_gamma) if g_gamma is not None else None
     h0_j = _torch_to_jax(h0) if h0 is not None else None
 
-    # Use interpret=True on CPU (Pallas kernels require it)
-    interpret = jax.default_backend() == "cpu"
+    # interpret mode is determined automatically via PALLAS_INTERPRET env var
     o, ht = chunk_simple_gla_fwd(
         q_j, k_j, v_j,
         g=None,

@@ -13,6 +13,11 @@ from tests.utils import compare_tensor
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_fwd_o_ref
 
 
+@pytest.fixture(autouse=True)
+def _pallas_interpret(monkeypatch):
+  monkeypatch.setenv("PALLAS_INTERPRET", "1")
+
+
 CASES = [
     dict(B=2, T=64, H=4, K=32, V=64, seed=0),
     dict(B=1, T=128, H=2, K=64, V=32, seed=1, gate="g"),
@@ -78,7 +83,6 @@ def test_chunk_fwd_o_pallas_vs_ref(cfg):
         g_gamma=g_gamma,
         scale=scale,
         chunk_size=chunk_size,
-        interpret=True,
     )
 
     assert compare_tensor("output", o_ref, o_pl, atol=1e-3, rtol=1e-3, max_ulp=2)
@@ -118,7 +122,6 @@ def test_chunk_fwd_o_varlen_matches_ref():
         g_gamma=g_gamma,
         cu_seqlens_cpu=seqlens,
         chunk_size=chunk_size,
-        interpret=True,
     )
 
     assert compare_tensor("output_varlen", o_ref, o, atol=1e-5, rtol=1e-5)

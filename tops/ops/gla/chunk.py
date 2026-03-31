@@ -8,7 +8,7 @@ import numpy as np
 from jax.experimental.pallas import dslice
 from jax.experimental.pallas import tpu as pltpu
 from tops.utils import pad_to_multiple, prepare_chunk_indices
-from tops.ops.utils import is_tpu_runtime
+from tops.ops.utils import get_interpret
 from tops.ops.common.chunk_h import chunk_fwd_h_kernel
 
 
@@ -136,7 +136,7 @@ def chunk_local_cumsum_vector(
     HAS_SCALE = scale is not None
     scale_val = scale if scale is not None else 1.0
 
-    interpret = not is_tpu_runtime()
+    interpret = get_interpret()
 
     # Pad the S dimension to satisfy TPU shape constraints.
     pad_S = (BS - (S % BS)) % BS
@@ -426,6 +426,7 @@ def chunk_gla_fwd_intra_gk(
             # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
+        interpret=get_interpret(),
     )(_q, _k, _g)
 
     # Post-reshape: [H, total_NT, BT, BT] -> [B, T, H, BT]
@@ -1389,6 +1390,7 @@ def chunk_gla_fwd_o_gk_pl(
             # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
+        interpret=get_interpret(),
     )(_q, _v, _g, _h, _A)
 
     # Post-process: (H, total_NT, BT, V) -> (B, T, H, V)
@@ -1556,6 +1558,7 @@ def chunk_gla_bwd_fused_pl(
             # vmem_limit_bytes=32 * 1024 * 1024, # 32 MB limit to be safe
             disable_bounds_checks=True,
         ),
+        interpret=get_interpret(),
     )(_q, _k, _v, _g, _h, _A, _do, _dh)
 
     # Post-process

@@ -10,7 +10,7 @@ from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
-from tops.ops.utils import is_tpu_runtime
+from tops.ops.utils import get_interpret
 from tops.utils import assert_shape, assert_shape_or_none, export_public, pad_to_multiple
 
 
@@ -233,7 +233,7 @@ def _chunk_simple_gla_fwd_intra(
 
     g_gamma_1d = g_gamma.reshape(-1)  # (H,)
 
-    interpret = not is_tpu_runtime()
+    interpret = get_interpret()
 
     # Reshape: [B, T, H, K] -> [H, B*NT, BT, K]
     _q = q.reshape(B, NT, BT, H, K).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, K)
@@ -352,7 +352,7 @@ def _chunk_simple_gla_fwd_o(
 
     g_gamma_1d = g_gamma.reshape(-1)  # (H,)
 
-    interpret = not is_tpu_runtime()
+    interpret = get_interpret()
 
     # Reshape: [B, T, H, X] -> [H, B*NT, BT, X]
     _q = q.reshape(B, NT, BT, H, K).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, K)
@@ -384,6 +384,7 @@ def _chunk_simple_gla_fwd_o(
             # vmem_limit_bytes=32 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
+        interpret=interpret,
     )(_q, _v, _h, _A, g_gamma_1d)
 
     # Post-reshape: (H, total_NT, BT, V) -> (B, T, H, V)
@@ -490,8 +491,6 @@ def chunk_simple_gla_fwd(
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all()
     assert (K % 128 == 0) and (V % 128 == 0)
 
-    interpret = not is_tpu_runtime()
-    
     h, ht = chunk_fwd_h(
         k=k,
         v=v,
@@ -505,7 +504,6 @@ def chunk_simple_gla_fwd(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
-        interpret=interpret,
     )
     o = chunk_fwd_o(
         q=q,
@@ -518,7 +516,6 @@ def chunk_simple_gla_fwd(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
-        interpret=interpret,
     )
     return o, ht
 
@@ -593,8 +590,6 @@ def chunk_simple_gla_bwd(
     assert scale is not None # fix pylance check
     # =================== assert kernel requirements done ===================
 
-    interpret = not is_tpu_runtime()
-
     # 1. Recompute h via chunk_fwd_h
     h, _ = chunk_fwd_h(
         k=k,
@@ -607,7 +602,6 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
 
     # Build synthetic gk from g_gamma for kernels that need it
@@ -626,7 +620,6 @@ def chunk_simple_gla_bwd(
         chunk_size=C,
         states_in_fp32=True,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
 
     # 4. Fused dq/dk/dv via simple GLA pallas kernel
@@ -634,7 +627,6 @@ def chunk_simple_gla_bwd(
         q, k, v, g_gamma, h, do, dh,
         scale=scale, chunk_size=C,
         cu_seqlens_dev=cu_seqlens_dev,
-        interpret=interpret,
     )
 
     return dq, dk, dv, dh0
