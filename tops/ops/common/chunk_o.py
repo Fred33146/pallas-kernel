@@ -207,22 +207,29 @@ def chunk_simple_gla_bwd_kernel(
     b_dv = b_dv_intra + b_dv_inter
     dv_ref[0, 0] = b_dv.astype(dv_ref.dtype)
 
-    # 3. dq = dA @ k_neg * exp(b_g) + do @ h^T * scale * exp(b_g)
-    k_neg = (b_k * jnp.exp(-b_g)[:, None]).astype(b_k.dtype)
-    b_dq_intra = jnp.dot(b_dA.astype(k_neg.dtype), k_neg,
+    # Apply gating to dA using stable difference pattern: exp(g_i - g_j)
+    # This avoids computing exp(-g) which overflows for large negative g.
+    # Mathematically equivalent: dA[i,j]*k[j]*exp(g_i-g_j) = dA[i,j]*k[j]*exp(-g_j)*exp(g_i)
+    b_dA_gated = jnp.where(
+        mask,
+        b_dA * jnp.exp(b_g[:, None] - b_g[None, :]),
+        0.0,
+    ).astype(b_k.dtype)
+
+    # 3. dq = gated_dA @ k + do @ h^T * scale * exp(b_g)
+    b_dq_intra = jnp.dot(b_dA_gated, b_k,
                           precision=jax.lax.Precision.HIGHEST,
-                          preferred_element_type=jnp.float32) * jnp.exp(b_g)[:, None]
+                          preferred_element_type=jnp.float32)
     b_dq_inter = jnp.dot(b_do, b_h.astype(b_do.dtype).T,
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32) * (scale * jnp.exp(b_g)[:, None])
     b_dq = b_dq_intra + b_dq_inter
     dq_ref[0, 0] = b_dq.astype(dq_ref.dtype)
 
-    # 4. dk = dA^T @ q_pos * exp(-b_g) + v @ dh^T * exp(b_gn - b_g)
-    q_pos = (b_q * jnp.exp(b_g)[:, None]).astype(b_q.dtype)
-    b_dk_intra = jnp.dot(b_dA.T.astype(q_pos.dtype), q_pos,
+    # 4. dk = gated_dA^T @ q + v @ dh^T * exp(b_gn - b_g)
+    b_dk_intra = jnp.dot(b_dA_gated.T.astype(b_q.dtype), b_q,
                           precision=jax.lax.Precision.HIGHEST,
-                          preferred_element_type=jnp.float32) * jnp.exp(-b_g)[:, None]
+                          preferred_element_type=jnp.float32)
     b_dk_inter = jnp.dot(b_v, b_dh.astype(b_v.dtype).T,
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32) * jnp.exp(b_gn - b_g)[:, None]

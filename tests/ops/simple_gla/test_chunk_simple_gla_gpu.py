@@ -204,7 +204,7 @@ def test_triton_chunk_vs_jax_chunk(cfg):
 
     g_gamma = None
     if gate == "g_gamma":
-        g_gamma = F.logsigmoid(torch.randn(H, dtype=dtype))
+        g_gamma = -torch.nn.functional.softplus(torch.rand(H).abs() * 0.5)  # negative log-decay
 
     N = B
     h0 = torch.randn(N, H, K, V, dtype=dtype) if cfg.get("h0") else None
@@ -265,7 +265,7 @@ def test_simple_gla_bwd_gamma(cfg):
     k = torch.randn(B, T, H, K, dtype=torch.bfloat16)
     v = torch.randn(B, T, H, V, dtype=torch.bfloat16)
     do = torch.randn(B, T, H, V, dtype=torch.bfloat16)
-    g_gamma = -torch.rand(H).abs() * 0.5  # negative log-decay
+    g_gamma = -torch.nn.functional.softplus(torch.rand(H).abs() * 0.5)  # negative log-decay
 
     N = B
     h0 = torch.randn(N, H, K, V) if cfg.get("h0") else None
@@ -299,7 +299,7 @@ def test_simple_gla_bwd_gamma(cfg):
     )
 
     NT = T // C
-    atol = cfg.get("atol", min(5e-1, 5e-2 * max(NT, 1)))
+    atol = cfg.get("atol", min(5e-2, 5e-2 * max(NT, 1)))
     rtol = cfg.get("rtol", 5e-2)
     # bf16 cross-platform (Triton GPU vs JAX interpret) backward comparison:
     # accumulation order differs fundamentally, dht cases amplify dh magnitude.

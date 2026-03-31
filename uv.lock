@@ -2481,6 +2481,7 @@ dependencies = [
     { name = "einops" },
     { name = "flax" },
     { name = "numpy" },
+    { name = "pytest" },
 ]
 
 [package.optional-dependencies]
@@ -2513,6 +2514,7 @@ requires-dist = [
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.8.1" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.5.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.0" },
     { name = "torch", marker = "extra == 'gpu'", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "tops", extra = "gpu" } },
