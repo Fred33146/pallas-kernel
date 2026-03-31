@@ -334,8 +334,8 @@ def _chunk_fwd_h_scan(k, v, g, g_gamma, gk, h0,
 
         # State update: h += k^T @ v  (contract C, batch B and H)
         kv = lax.dot_general(
-            b_k.astype(jnp.float32),
-            b_v.astype(jnp.float32),
+            b_k,
+            b_v,
             dimension_numbers=(((1,), (1,)), ((0, 2), (0, 2))),
             precision=lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
@@ -547,8 +547,8 @@ def _chunk_bwd_dh_scan(q, do, g, g_gamma, gk, dht,
 
         # Accumulate: dh += q_hat^T @ do  (contract C, batch B and H)
         dh = dh + lax.dot_general(
-            b_q_hat.astype(jnp.float32),
-            b_do.astype(jnp.float32),
+            b_q_hat,
+            b_do,
             dimension_numbers=(((1,), (1,)), ((0, 2), (0, 2))),
             precision=lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,

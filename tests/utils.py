@@ -2,7 +2,71 @@ import math
 
 import torch
 import jax
+import jax.numpy as jnp
 import numpy as np
+
+
+def torch_to_jax(t: torch.Tensor, dtype=None) -> jax.Array:
+    """Convert a torch tensor to a JAX array.
+
+    Args:
+        t: Input torch tensor.
+        dtype: Target JAX dtype. If None, preserves bfloat16 when the input
+            is bfloat16, otherwise uses float32.
+    """
+    np_arr = t.detach().cpu().float().numpy()
+    jax_arr = jnp.array(np_arr)
+    if dtype is not None:
+        return jax_arr.astype(dtype)
+    if t.dtype == torch.bfloat16:
+        return jax_arr.astype(jnp.bfloat16)
+    return jax_arr
+
+
+def build_alibi_slopes(n_attention_heads: int) -> np.ndarray:
+    """Build ALiBi slopes identical to MaxText BailingMoeV2LinearAttention.
+
+    Args:
+        n_attention_heads: Number of attention heads.
+
+    Returns:
+        np.ndarray of shape (n_attention_heads,) with float32 slopes.
+    """
+
+    def get_slopes(n):
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            ratio = start
+            return [start * ratio ** i for i in range(n)]
+
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(n)
+        closest_power_of_2 = 2 ** math.floor(math.log2(n))
+        return (
+            get_slopes_power_of_2(closest_power_of_2)
+            + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        )
+
+    return np.array(get_slopes(n_attention_heads), dtype=np.float32)
+
+
+def make_alibi_g_gamma(
+    H: int, num_layers: int, layer_idx: int
+) -> jnp.ndarray:
+    """Build g_gamma exactly as MaxText does for a given layer.
+
+    Args:
+        H: Number of attention heads.
+        num_layers: Total number of decoder layers.
+        layer_idx: Index of the current layer (0-based).
+
+    Returns:
+        jnp.ndarray of shape (H,) with per-head negative decay rates.
+    """
+    slope_base = build_alibi_slopes(H)
+    denom = max(num_layers - 1, 1)
+    slope_scale = 1.0 - layer_idx / denom + 1e-5
+    return jnp.array(-slope_base * slope_scale)
 
 
 def compute_ulp(x, dtype=None):

@@ -198,7 +198,6 @@ def _chunk_simple_gla_fwd_intra_kernel(
         jnp.dot(
             b_q,
             b_k.T,
-            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
         * scale
@@ -312,7 +311,6 @@ def _chunk_simple_gla_fwd_o_kernel(
     b_o = jnp.dot(
         b_q,
         b_h.astype(b_q.dtype),
-        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     b_o = b_o * (scale * g_exp[:, None])  # scale + gate in one multiply
@@ -323,7 +321,6 @@ def _chunk_simple_gla_fwd_o_kernel(
     b_o += jnp.dot(
         b_A,
         b_v,
-        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
 
@@ -500,7 +497,7 @@ def chunk_simple_gla_fwd(
         gv=None,
         h0=h0,
         output_final_state=use_ht,
-        states_in_fp32=True,
+        states_in_fp32=False,
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,

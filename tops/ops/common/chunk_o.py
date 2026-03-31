@@ -48,15 +48,11 @@ def _chunk_fwd_o_kernel(
     b_h = h_ref[0, 0]  # (K, BV)
 
     b_o = jnp.dot(
-        b_q.astype(jnp.float32),
-        b_h.astype(jnp.float32),
-        precision=jax.lax.Precision.HIGHEST,
+        b_q, b_h,
         preferred_element_type=jnp.float32,
     )
     b_A = jnp.dot(
-        b_q.astype(jnp.float32),
-        b_k.astype(jnp.float32).T,
-        precision=jax.lax.Precision.HIGHEST,
+        b_q, b_k.T,
         preferred_element_type=jnp.float32,
     )
 
@@ -70,18 +66,19 @@ def _chunk_fwd_o_kernel(
         b_gamma = g_gamma_ref[head_idx].astype(jnp.float32)
         b_g_gamma = b_gamma * (jnp.arange(BT) + 1).astype(jnp.float32)
         b_o = b_o * exp(b_g_gamma)[:, None]
-        b_A = b_A * exp(b_g_gamma[:, None] - b_g_gamma[None, :])
+        _mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+        b_A = b_A * jnp.exp(jnp.where(_mask, b_g_gamma[:, None] - b_g_gamma[None, :], 0.0))
 
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_A = jnp.where(mask, b_A, 0.0)
     scale = scale_ref[0].astype(jnp.float32)
 
-    b_o = (b_o + jnp.dot(
-        b_A.astype(jnp.float32),
-        b_v.astype(jnp.float32),
+    # Keep b_A in fp32 for precision; upcast b_v instead.
+    b_o = b_o * scale + jnp.dot(
+        b_A, b_v.astype(jnp.float32),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
-    )) * scale
+    ) * scale
     o_ref[0, 0] = b_o.astype(o_ref.dtype)
 
 
@@ -209,66 +206,56 @@ def chunk_simple_gla_bwd_kernel(
 
     # Recompute A in-kernel: A = (q @ k^T) * scale * decay
     pos = (jnp.arange(BT) + 1).astype(jnp.float32)
-    decay = jnp.exp(b_gamma * (pos[:, None] - pos[None, :]))
+    mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+    g_diff = b_gamma * (pos[:, None] - pos[None, :])
+    decay = jnp.exp(jnp.where(mask, g_diff, 0.0))
     b_a = jnp.dot(
-        b_q.astype(jnp.float32), b_k.astype(jnp.float32).T,
-        precision=jax.lax.Precision.HIGHEST,
+        b_q, b_k.T,
         preferred_element_type=jnp.float32,
     ) * scale * decay
 
     # 1. dA = do @ v^T * scale, masked lower-triangular
     b_dA = jnp.dot(
-        b_do.astype(jnp.float32),
-        b_v.astype(jnp.float32).T,
-        precision=jax.lax.Precision.HIGHEST,
+        b_do, b_v.T,
         preferred_element_type=jnp.float32,
     ) * scale
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_dA = jnp.where(mask, b_dA, 0.0)
 
     # 2. dv = A^T @ do + k_decay @ dh
-    b_a_masked = jnp.where(mask, b_a, 0.0)
+    b_a_masked = jnp.where(mask, b_a, 0.0).astype(b_do.dtype)
     b_dv_intra = jnp.dot(
-        b_a_masked.T.astype(jnp.float32),
-        b_do.astype(jnp.float32),
-        precision=jax.lax.Precision.HIGHEST,
+        b_a_masked.T, b_do,
         preferred_element_type=jnp.float32,
     )
-    k_decay = b_k * jnp.exp(b_gn - b_g)[:, None]
+    k_decay = (b_k * jnp.exp(b_gn - b_g)[:, None]).astype(b_k.dtype)
     b_dv_inter = jnp.dot(
-        k_decay.astype(jnp.float32),
-        b_dh.astype(jnp.float32),
-        precision=jax.lax.Precision.HIGHEST,
+        k_decay, b_dh.astype(b_k.dtype),
         preferred_element_type=jnp.float32,
     )
     b_dv = b_dv_intra + b_dv_inter
     dv_ref[0, 0] = b_dv.astype(dv_ref.dtype)
 
-    # Apply gating to dA using stable difference pattern: exp(g_i - g_j)
-    # This avoids computing exp(-g) which overflows for large negative g.
-    # Mathematically equivalent: dA[i,j]*k[j]*exp(g_i-g_j) = dA[i,j]*k[j]*exp(-g_j)*exp(g_i)
+    # Apply gating to dA: exp(g_i - g_j)
+    b_g_diff = b_g[:, None] - b_g[None, :]
     b_dA_gated = jnp.where(
         mask,
-        b_dA * jnp.exp(b_g[:, None] - b_g[None, :]),
+        b_dA * jnp.exp(jnp.where(mask, b_g_diff, 0.0)),
         0.0,
     )
 
     # 3. dq = gated_dA @ k + do @ h^T * scale * exp(b_g)
-    b_dq_intra = jnp.dot(b_dA_gated.astype(jnp.float32), b_k.astype(jnp.float32),
-                          precision=jax.lax.Precision.HIGHEST,
+    b_dq_intra = jnp.dot(b_dA_gated.astype(b_k.dtype), b_k,
                           preferred_element_type=jnp.float32)
-    b_dq_inter = jnp.dot(b_do.astype(jnp.float32), b_h.astype(jnp.float32).T,
-                          precision=jax.lax.Precision.HIGHEST,
+    b_dq_inter = jnp.dot(b_do, b_h.astype(b_do.dtype).T,
                           preferred_element_type=jnp.float32) * (scale * jnp.exp(b_g)[:, None])
     b_dq = b_dq_intra + b_dq_inter
     dq_ref[0, 0] = b_dq.astype(dq_ref.dtype)
 
     # 4. dk = gated_dA^T @ q + v @ dh^T * exp(b_gn - b_g)
-    b_dk_intra = jnp.dot(b_dA_gated.T.astype(jnp.float32), b_q.astype(jnp.float32),
-                          precision=jax.lax.Precision.HIGHEST,
+    b_dk_intra = jnp.dot(b_dA_gated.T.astype(b_q.dtype), b_q,
                           preferred_element_type=jnp.float32)
-    b_dk_inter = jnp.dot(b_v.astype(jnp.float32), b_dh.astype(jnp.float32).T,
-                          precision=jax.lax.Precision.HIGHEST,
+    b_dk_inter = jnp.dot(b_v, b_dh.astype(b_v.dtype).T,
                           preferred_element_type=jnp.float32) * jnp.exp(b_gn - b_g)[:, None]
     b_dk = b_dk_intra + b_dk_inter
     dk_ref[0, 0] = b_dk.astype(dk_ref.dtype)
@@ -422,20 +409,21 @@ def chunk_fwd_o_ref(
         g_gamma_f32 = g_gamma.astype(jnp.float32)
         ramp = g_gamma_f32[:, None] * (jnp.arange(C) + 1)[None, :]  # [H, C] float32
         o_inter = o_inter * exp(ramp)[None, None, :, :, None]
-        A = A * exp(ramp[..., :, None] - ramp[..., None, :])[None, None]
+        ramp_diff = ramp[..., :, None] - ramp[..., None, :]
+        _causal = jnp.arange(C)[:, None] >= jnp.arange(C)[None, :]
+        A = A * exp(jnp.where(_causal, ramp_diff, 0.0))[None, None]
 
     # Causal mask (lower triangular: i >= j)
     causal_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
     A = jnp.where(causal_mask, A, 0.0)
 
     # Intra: A @ V_c -> [B, NT, H, C, V]
-    # Keep A in fp32 for precision; JAX handles mixed-dtype promotion.
-    o_intra = jnp.matmul(A, v_c.astype(jnp.float32),
+    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c,
     precision=jax.lax.Precision.HIGHEST,
     preferred_element_type=jnp.float32)
 
     # Combine
-    o = (o_inter + o_intra) * scale
+    o = o_inter * scale + o_intra * scale
 
     # [B, NT, H, C, V] -> [B, NT, C, H, V] -> [B, T, H, V]
     o = o.transpose(0, 1, 3, 2, 4).reshape(B, T, H, V)
@@ -535,8 +523,9 @@ def chunk_bwd_dv(
     do_c = do.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)  # [B, NT, H, C, V]
 
     # Inter-chunk: K_c @ dH -> [B, NT, H, C, V]
+    # Cast dh to k's dtype to match Triton: tl.dot(b_k, b_dh.to(b_k.dtype))
     dv_inter = jnp.matmul(
-        k_c, dh,
+        k_c, dh.astype(k_c.dtype),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
@@ -564,7 +553,9 @@ def chunk_bwd_dv(
         ramp = g_gamma[:, None] * (jnp.arange(C) + 1)[None, :]  # [H, C]
         ramp_last = ramp[..., -1:]  # [H, 1]
         dv_inter = dv_inter * exp(-ramp + ramp_last)[None, None, :, :, None]
-        A = A * exp(ramp[..., None, :] - ramp[..., :, None])[None, None]
+        ramp_diff_dv = ramp[..., None, :] - ramp[..., :, None]
+        _upper = jnp.arange(C)[:, None] <= jnp.arange(C)[None, :]
+        A = A * exp(jnp.where(_upper, ramp_diff_dv, 0.0))[None, None]
 
     # Upper-triangular mask: keep j <= i  (row=j, col=i)
     upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.bool_))
@@ -642,15 +633,17 @@ to obtain the final gate gradient.
     do_c = do.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)
 
     # Inter-chunk: dq_inter = do @ h^T -> [B, NT, H, C, K]
+    # Cast h to do's dtype to match Triton: tl.dot(b_do, b_h.to(b_do.dtype))
     dq_inter = jnp.matmul(
-        do_c, jnp.swapaxes(h, -2, -1),
+        do_c, jnp.swapaxes(h.astype(do_c.dtype), -2, -1),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
 
     # Inter-chunk: dk_inter = v @ dh^T -> [B, NT, H, C, K]
+    # Cast dh to v's dtype to match Triton: tl.dot(b_v, b_dh.to(b_v.dtype))
     dk_inter = jnp.matmul(
-        v_c, jnp.swapaxes(dh, -2, -1),
+        v_c, jnp.swapaxes(dh.astype(v_c.dtype), -2, -1),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
@@ -660,7 +653,7 @@ to obtain the final gate gradient.
     if w is not None and dv is not None:
         dv_c = dv.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)
         dw_c = jnp.matmul(
-            dv_c, jnp.swapaxes(h, -2, -1),
+            dv_c, jnp.swapaxes(h.astype(dv_c.dtype), -2, -1),
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
@@ -754,9 +747,10 @@ to obtain the final gate gradient.
         dk_inter = dk_inter * exp(-ramp + ramp_last)[None, None, :, :, None]
 
         # ds with gamma
+        ramp_diff_ds = ramp[..., :, None] - ramp[..., None, :]
         ds = jnp.where(
             causal_mask,
-            ds * exp(ramp[..., :, None] - ramp[..., None, :])[None, None],
+            ds * exp(jnp.where(causal_mask, ramp_diff_ds, 0.0))[None, None],
             0.0,
         ) * scale
 
