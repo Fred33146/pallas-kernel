@@ -18,7 +18,6 @@ import jax.experimental.pallas.tpu as pltpu
 from tops.ops.utils import exp, is_tpu_runtime
 from tops.utils import assert_shape, assert_shape_or_none
 
-
 def _chunk_fwd_o_kernel(
     q_ref,
     k_ref,
@@ -49,14 +48,14 @@ def _chunk_fwd_o_kernel(
     b_h = h_ref[0, 0]  # (K, BV)
 
     b_o = jnp.dot(
-        b_q,
-        b_h,
+        b_q.astype(jnp.float32),
+        b_h.astype(jnp.float32),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     b_A = jnp.dot(
-        b_q,
-        b_k.T,
+        b_q.astype(jnp.float32),
+        b_k.astype(jnp.float32).T,
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
@@ -78,8 +77,8 @@ def _chunk_fwd_o_kernel(
     scale = scale_ref[0].astype(jnp.float32)
 
     b_o = (b_o + jnp.dot(
-        b_A.astype(b_v.dtype),
-        b_v,
+        b_A.astype(jnp.float32),
+        b_v.astype(jnp.float32),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )) * scale
@@ -102,7 +101,13 @@ def _chunk_fwd_o_pl(
     chunk_size: int = 64,
     interpret: bool = False,
 ) -> jax.Array:
-    """Pallas launcher for chunk_fwd_o on the uniform-length path."""
+    """Pallas launcher for chunk_fwd_o on the uniform-length path.
+
+    V-tiling: when V > 128, the V dimension is split into BV=128 tiles.
+    V-tiles are merged into the H grid dimension (H_VT = H * num_v_tiles)
+    so each kernel invocation processes a (head, V-tile) pair. q/k/g are
+    shared across V-tiles via index_map arithmetic; v/h/o are V-tile-local.
+    """
     B, T, H, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
@@ -112,9 +117,9 @@ def _chunk_fwd_o_pl(
     def _reshape_bt(x, D):
         return x.reshape(B, NT, BT, H, D).transpose(3, 0, 1, 2, 4).reshape(H, total_NT, BT, D)
 
-    _q = _reshape_bt(q, K)
-    _k = _reshape_bt(k, K)
-    _v = _reshape_bt(v, V)
+    _q = _reshape_bt(q, K)       # (H, total_NT, BT, K)
+    _k = _reshape_bt(k, K)       # (H, total_NT, BT, K)
+    _v = _reshape_bt(v, V)       # (H, total_NT, BT, V)
     _h = h.reshape(B, NT, H, K, V).transpose(2, 0, 1, 3, 4).reshape(H, total_NT, K, V)
     _g = None
     if g is not None:
@@ -122,24 +127,48 @@ def _chunk_fwd_o_pl(
 
     BV = 128 if V % 128 == 0 else V
     num_v_tiles = V // BV
-    grid = (H, total_NT, num_v_tiles)
 
-    spec_qk = pl.BlockSpec((1, 1, BT, K), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, 0))
-    spec_v = pl.BlockSpec((1, 1, BT, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV))
-    spec_h = pl.BlockSpec((1, 1, K, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV))
-    spec_g = None if _g is None else pl.BlockSpec((1, 1, BT), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0))
+    if num_v_tiles > 1:
+        # Split V into tiles and merge with H: (H, ..., V) → (H*num_v_tiles, ..., BV)
+        _v = _v.reshape(H, total_NT, BT, num_v_tiles, BV).transpose(0, 3, 1, 2, 4).reshape(H * num_v_tiles, total_NT, BT, BV)
+        _h = _h.reshape(H, total_NT, K, num_v_tiles, BV).transpose(0, 3, 1, 2, 4).reshape(H * num_v_tiles, total_NT, K, BV)
+        # g_gamma: repeat each head value for its V-tiles
+        if g_gamma is not None:
+            g_gamma = jnp.repeat(g_gamma, num_v_tiles)  # (H * num_v_tiles,)
+
+    H_VT = H * num_v_tiles
+    grid = (H_VT, total_NT)
+
+    # q/k/g index by head = hv_idx // num_v_tiles; v/h index by hv_idx directly
+    spec_qk = pl.BlockSpec((1, 1, BT, K), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0, 0))
+    spec_v = pl.BlockSpec((1, 1, BT, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
+    spec_h = pl.BlockSpec((1, 1, K, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
+    spec_g = None if _g is None else pl.BlockSpec((1, 1, BT), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0))
     spec_gamma = None if g_gamma is None else pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
     spec_scale = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
     o = pl.pallas_call(
         functools.partial(_chunk_fwd_o_kernel, BT=BT),
-        grid=grid,
-        out_shape=jax.ShapeDtypeStruct((H, total_NT, BT, V), v.dtype),
-        in_specs=[spec_qk, spec_qk, spec_v, spec_h, spec_g, spec_gamma, spec_scale],
-        out_specs=pl.BlockSpec((1, 1, BT, BV), index_map=lambda h_idx, nt_idx, v_idx: (h_idx, nt_idx, 0, v_idx * BV)),
-        compiler_params=pltpu.CompilerParams(),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=grid,
+            in_specs=[spec_qk, spec_qk, spec_v, spec_h, spec_g, spec_gamma, spec_scale],
+            out_specs=pl.BlockSpec((1, 1, BT, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((H_VT, total_NT, BT, BV), v.dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+        ),
         interpret=interpret,
     )(_q, _k, _v, _h, _g, g_gamma, jnp.asarray(scale, dtype=jnp.float32).reshape(1))
+
+    if num_v_tiles > 1:
+        # (H*num_v_tiles, total_NT, BT, BV) → (H, num_v_tiles, total_NT, BT, BV)
+        # → (H, total_NT, BT, num_v_tiles, BV) → (H, total_NT, BT, V)
+        o = o.reshape(H, num_v_tiles, total_NT, BT, BV).transpose(0, 2, 3, 1, 4).reshape(H, total_NT, BT, V)
+    else:
+        # Already (H, total_NT, BT, V) after reshape
+        pass
 
     o = o.reshape(H, B, NT, BT, V).transpose(1, 2, 3, 0, 4)
     return o.reshape(B, T, H, V)
@@ -182,28 +211,36 @@ def chunk_simple_gla_bwd_kernel(
     pos = (jnp.arange(BT) + 1).astype(jnp.float32)
     decay = jnp.exp(b_gamma * (pos[:, None] - pos[None, :]))
     b_a = jnp.dot(
-        b_q, b_k.T,
+        b_q.astype(jnp.float32), b_k.astype(jnp.float32).T,
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     ) * scale * decay
 
     # 1. dA = do @ v^T * scale, masked lower-triangular
-    b_A_do = b_do.astype(b_v.dtype)
-    b_dA = jnp.dot(b_A_do, b_v.T,
-                   precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=jnp.float32) * scale
+    b_dA = jnp.dot(
+        b_do.astype(jnp.float32),
+        b_v.astype(jnp.float32).T,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ) * scale
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_dA = jnp.where(mask, b_dA, 0.0)
 
     # 2. dv = A^T @ do + k_decay @ dh
     b_a_masked = jnp.where(mask, b_a, 0.0)
-    b_dv_intra = jnp.dot(b_a_masked.T.astype(b_do.dtype), b_do,
-                          precision=jax.lax.Precision.HIGHEST,
-                          preferred_element_type=jnp.float32)
-    k_decay = (b_k * jnp.exp(b_gn - b_g)[:, None]).astype(b_k.dtype)
-    b_dv_inter = jnp.dot(k_decay, b_dh.astype(k_decay.dtype),
-                          precision=jax.lax.Precision.HIGHEST,
-                          preferred_element_type=jnp.float32)
+    b_dv_intra = jnp.dot(
+        b_a_masked.T.astype(jnp.float32),
+        b_do.astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    k_decay = b_k * jnp.exp(b_gn - b_g)[:, None]
+    b_dv_inter = jnp.dot(
+        k_decay.astype(jnp.float32),
+        b_dh.astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
     b_dv = b_dv_intra + b_dv_inter
     dv_ref[0, 0] = b_dv.astype(dv_ref.dtype)
 
@@ -214,23 +251,23 @@ def chunk_simple_gla_bwd_kernel(
         mask,
         b_dA * jnp.exp(b_g[:, None] - b_g[None, :]),
         0.0,
-    ).astype(b_k.dtype)
+    )
 
     # 3. dq = gated_dA @ k + do @ h^T * scale * exp(b_g)
-    b_dq_intra = jnp.dot(b_dA_gated, b_k,
+    b_dq_intra = jnp.dot(b_dA_gated.astype(jnp.float32), b_k.astype(jnp.float32),
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32)
-    b_dq_inter = jnp.dot(b_do, b_h.astype(b_do.dtype).T,
+    b_dq_inter = jnp.dot(b_do.astype(jnp.float32), b_h.astype(jnp.float32).T,
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32) * (scale * jnp.exp(b_g)[:, None])
     b_dq = b_dq_intra + b_dq_inter
     dq_ref[0, 0] = b_dq.astype(dq_ref.dtype)
 
     # 4. dk = gated_dA^T @ q + v @ dh^T * exp(b_gn - b_g)
-    b_dk_intra = jnp.dot(b_dA_gated.T.astype(b_q.dtype), b_q,
+    b_dk_intra = jnp.dot(b_dA_gated.T.astype(jnp.float32), b_q.astype(jnp.float32),
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32)
-    b_dk_inter = jnp.dot(b_v, b_dh.astype(b_v.dtype).T,
+    b_dk_inter = jnp.dot(b_v.astype(jnp.float32), b_dh.astype(jnp.float32).T,
                           precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32) * jnp.exp(b_gn - b_g)[:, None]
     b_dk = b_dk_intra + b_dk_inter
@@ -392,7 +429,8 @@ def chunk_fwd_o_ref(
     A = jnp.where(causal_mask, A, 0.0)
 
     # Intra: A @ V_c -> [B, NT, H, C, V]
-    o_intra = jnp.matmul(A.astype(v_c.dtype), v_c,
+    # Keep A in fp32 for precision; JAX handles mixed-dtype promotion.
+    o_intra = jnp.matmul(A, v_c.astype(jnp.float32),
     precision=jax.lax.Precision.HIGHEST,
     preferred_element_type=jnp.float32)
 
@@ -580,9 +618,9 @@ def chunk_bwd_dqkwg(
     Returns (dq, dk, dw, dg).
 
     Note: when g is provided, the returned dg is the *raw* per-position
-    gradient (with dg_last folded into the last position of each chunk,
-    but NOT reverse-cumsummed).  The caller must apply reverse cumsum
-    to obtain the final gate gradient.
+gradient (with dg_last folded into the last position of each chunk,
+but NOT reverse-cumsummed).  The caller must apply reverse cumsum
+to obtain the final gate gradient.
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -710,7 +748,7 @@ def chunk_bwd_dqkwg(
     elif g_gamma is not None:
         g_gamma_f32 = g_gamma.astype(jnp.float32)
         ramp = g_gamma_f32[:, None] * (jnp.arange(C) + 1)[None, :]  # [H, C]
-        ramp_last = ramp[:, -1:]  # [H, 1]
+        ramp_last = ramp[..., -1:]  # [H, 1]
 
         # dq_inter with gamma
         dq_inter = dq_inter * exp(ramp)[None, None, :, :, None] * scale

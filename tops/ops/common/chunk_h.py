@@ -255,8 +255,8 @@ def chunk_fwd_h_kernel(
             dimension_semantics=(
                 "parallel",
                 "parallel",
-                "arbitrary",
-                "arbitrary",
+                "parallel",
+                "parallel",
                 "arbitrary",
             ),
             # vmem_limit_bytes=32 * 1024 * 1024,

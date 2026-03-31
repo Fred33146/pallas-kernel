@@ -203,7 +203,8 @@ def chunk_fwd_o(
         b_A = b_A * jnp.exp(b_g_gamma[None, :, :, None] - b_g_gamma_key[None, None, :, :])
 
       b_A = jnp.where(causal_mask[None, :, None, :], b_A, 0)
-      b_o = b_o * scale + dot("bihj,bjhv->bihv", b_A.astype(v.dtype), b_v, acc) * scale
+      # Keep b_A in fp32 for precision; upcast b_v instead.
+      b_o = b_o * scale + dot("bihj,bjhv->bihv", b_A, b_v.astype(jnp.float32), acc) * scale
 
       o_buf = write_chunk(o_buf, b_o.astype(v.dtype), start, valid_len)
 
@@ -248,7 +249,8 @@ def chunk_fwd_o(
       b_A = b_A * jnp.exp(b_g_gamma[None, :, :, None] - b_g_gamma_key[None, None, :, :])
 
     b_A = jnp.where(causal_mask[None, :, None, :], b_A, 0)
-    b_o = b_o * scale + dot("bihj,bjhv->bihv", b_A.astype(v.dtype), b_v, acc) * scale
+    # Keep b_A in fp32 for precision; upcast b_v instead.
+    b_o = b_o * scale + dot("bihj,bjhv->bihv", b_A, b_v.astype(jnp.float32), acc) * scale
 
     o_chunks.append(b_o.astype(v.dtype))
 

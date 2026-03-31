@@ -501,7 +501,7 @@ def chunk_simple_gla_fwd(
         gv=None,
         h0=h0,
         output_final_state=use_ht,
-        states_in_fp32=False,
+        states_in_fp32=True,
         cu_seqlens_cpu=cu_seqlens_cpu,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
