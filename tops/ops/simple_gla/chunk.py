@@ -519,21 +519,6 @@ def chunk_simple_gla_fwd(
     )
     return o, ht
 
-def _build_gk_from_gamma(g_gamma: jax.Array, B: int, T: int, H: int, K: int, chunk_size: int) -> jax.Array:
-    """Build equivalent gk [B, T, H, K] from g_gamma [H] for reuse with existing kernels.
-
-    For each chunk of size C, position t_in_chunk gets gate value gamma[h] * (t_in_chunk + 1).
-    This is the chunk-local cumsum of a constant per-step gate of gamma[h].
-    """
-    C = chunk_size
-    NT = T // C
-    # pos = [1, 2, ..., C] tiled NT times -> [T]
-    pos = jnp.tile(jnp.arange(1, C + 1), NT)  # [T]
-    # gc[t, h] = gamma[h] * pos[t_in_chunk]
-    gc = pos[:, None] * g_gamma[None, :]  # [T, H]
-    # broadcast to [B, T, H, K]
-    return jnp.broadcast_to(gc[None, :, :, None], (B, T, H, K))
-
 def chunk_simple_gla_bwd(
     q: jax.Array,
     k: jax.Array,
@@ -604,15 +589,12 @@ def chunk_simple_gla_bwd(
         cu_seqlens_dev=cu_seqlens_dev,
     )
 
-    # Build synthetic gk from g_gamma for kernels that need it
-    gk = _build_gk_from_gamma(g_gamma, B, T, H, K, C) if g_gamma is not None else None
-
     # 2. Compute dh via chunk_bwd_dh_kernel
     dh, dh0 = chunk_bwd_dh(
         q, k, v,
         g=None,
-        g_gamma=None,
-        gk=gk,
+        g_gamma=g_gamma,
+        gk=None,
         do=do,
         dht=dht,
         scale=scale,

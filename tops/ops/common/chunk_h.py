@@ -872,6 +872,7 @@ def chunk_bwd_dh_kernel(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=32 * 1024 * 1024,
+            disable_bounds_checks=True,
         ),
     )(q, do, dht, gk, g, g_gamma, cu_seqlens_dev, chunk_to_seq)
 
