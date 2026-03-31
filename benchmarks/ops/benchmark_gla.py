@@ -24,6 +24,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import os
 
 from benchmarks.utils import add_common_args, bench_fn, run_benchmark
 from tops.ops.gla import (
@@ -210,8 +211,8 @@ def _run_provider(
         fn = run_bwd
     else:
         raise ValueError(f"Unknown provider: {provider}")
-
-    return bench_fn(fn, warmup=warmup, iters=iters)
+    profile_dir = os.environ.get("PROFILE_DIR")
+    return bench_fn(provider ,fn, warmup=warmup, iters=iters, profile_dir=profile_dir)
 
 
 # ---------------------------------------------------------------------------

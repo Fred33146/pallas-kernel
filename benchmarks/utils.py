@@ -39,15 +39,18 @@ import time
 from typing import Callable
 
 import jax
+import os
 
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 
 
 def bench_fn(
+    name: str,
     fn: Callable,
     warmup: int = DEFAULT_WARMUP,
     iters: int = DEFAULT_ITERS,
+    profile_dir=None,
 ) -> float:
     """Time *fn* using wall-clock after JAX compilation and warmup.
 
@@ -64,13 +67,20 @@ def bench_fn(
         jax.block_until_ready(out)
 
     times = []
+    # Profiled run
+    trace_dir = os.path.join(profile_dir, name) if profile_dir else None
+    if trace_dir:
+        jax.profiler.start_trace(trace_dir)
+
     for _ in range(iters):
         t0 = time.perf_counter()
         out = fn()
         jax.block_until_ready(out)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)
-
+    if trace_dir:
+        jax.profiler.stop_trace()
+        print(f"  Profile saved to {trace_dir}")
     times.sort()
     return times[len(times) // 2]
 
