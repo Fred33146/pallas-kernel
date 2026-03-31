@@ -56,7 +56,7 @@ The current package-level dependency tree (ordered bottom-up):
 
 ### 3.1 Reference Implementations & Tests
 
-*   **`tops/cpu/`** is the sole location for canonical reference implementations (Gold/Reference). All reference implementations are written in pure JAX, executed on CPU, and serve as the standard answers (Goldens). The directory is organized by operator domain:
+*   **`tops/cpu/`** is the sole location for canonical reference implementations (Gold/Reference). All reference implementations are written in pure JAX, **executed on CPU at high precision (e.g., float64)**, and serve as the standard answers (Goldens). The directory is organized by operator domain:
 
     ```
     tops/cpu/
@@ -77,17 +77,22 @@ The current package-level dependency tree (ordered bottom-up):
     └── mla/          # Reference tests for MLA implementations
     ```
 
-*   **Alignment requirement**: All new Pallas/JAX implementations added to `tops/ops/` must align with `tops/cpu/` and pass reference comparison tests.
+*   **Alignment requirement**: All new Pallas/JAX implementations added to `tops/ops/` (GPU or TPU) must align with `tops/cpu/` high-precision reference implementations and pass comparison tests.
 *   **How reference correctness is established**: The correctness of `tops/cpu/` must be continuously validated through tests in `tests/ref/` against `torch_gpu/torch_cpu` comparisons, so it remains a trustworthy baseline.
 
-### 3.2 Operator & Layer Tests
+### 3.2 Kernel Correctness Methodology
 
-*   Test types within the `tests/` directory are strictly restricted to the following two types of reference comparisons:
-    1.  **CPU Reference Tests (vs JAX-CPU)**: Output and gradients from Pallas kernels are checked for tolerance against reference implementations in `tops/cpu/` written in pure JAX.
-    2.  **GPU Reference Tests (vs Torch-GPU/Triton)**: Aligning the computation results of Pallas kernels against known-correct, cross-framework computation libraries (such as those based on PyTorch or existing high-priority components like FlashAttention) under identical hardware conditions.
-*   **`tests/ops/`**: Modifications to low-level operators (e.g., scheduling optimizations of Pallas kernels) must use the two comparison test categories above to verify results or gradient tolerances. It is strictly prohibited to overstep and rely on high-level tests (such as `test_gla.py` in the layers tier) as a workaround for validation.
+All Kernel correctness validation uses the **high-precision JAX CPU reference implementations** in `tops/cpu/` as the sole Golden baseline. Both GPU and TPU implementations are compared against this baseline with tolerance checks, and the TPU error must not exceed the GPU error:
+
+1.  **GPU Comparison Tests (GPU vs High-Precision CPU JAX)**: Output and gradients from GPU Pallas/JAX kernels are checked for tolerance against the high-precision pure JAX reference implementations in `tops/cpu/`. The error level is recorded as $\epsilon_{\text{GPU}}$.
+2.  **TPU Comparison Tests (TPU vs High-Precision CPU JAX)**: Output and gradients from TPU Pallas kernels are checked for tolerance against the high-precision pure JAX reference implementations in `tops/cpu/`. The error level is recorded as $\epsilon_{\text{TPU}}$.
+3.  **Error Bound Constraint**: **The TPU→CPU error must not exceed the GPU→CPU error**, i.e., $\epsilon_{\text{TPU}} \leq \epsilon_{\text{GPU}}$ must hold. If a TPU implementation exhibits higher error than the corresponding GPU implementation, it is treated as a precision defect in the TPU Kernel that must be fixed. This constraint ensures TPU Kernels maintain numerical precision at least on par with GPU Kernels.
+
+### 3.3 Operator & Layer Tests
+
+*   **`tests/ops/`**: Modifications to low-level operators (e.g., scheduling optimizations of Pallas kernels) must use the GPU/TPU comparison tests described above to verify results or gradient tolerances. It is strictly prohibited to overstep and rely on high-level tests (such as `test_gla.py` in the layers tier) as a workaround for validation.
 *   **`tests/modules/` & `tests/layers/`**: Modifications at the network component or layer levels must include corresponding integration encapsulation and data flow validation tests.
-*   **Default comparator and GPU-specific exception**: The default comparator is `tops/cpu/`. If GPU-based comparison is required (e.g., Torch/Triton), create a separate test file and append the `_gpu` suffix to its filename.
+*   **Default comparator**: All tests default to comparing against the `tops/cpu/` high-precision reference implementation. GPU test files are named with a `_gpu` suffix, and TPU test files are named with a `_tpu` suffix.
 
 ---
 

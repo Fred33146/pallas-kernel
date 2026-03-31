@@ -54,7 +54,7 @@
 
 ### 3.1 参考实现与参考测试 (Reference Implementations & Tests)
 
-*   **`tops/cpu/`** 是标准参考实现（Gold/Reference）的唯一存放位置。所有参考实现使用纯 JAX 编写，在 CPU 上运行，作为标准答案输出（Goldens）。目录结构按算子域组织：
+*   **`tops/cpu/`** 是标准参考实现（Gold/Reference）的唯一存放位置。所有参考实现使用纯 JAX 编写，**以高精度（如 float64）在 CPU 上运行**，作为标准答案输出（Goldens）。目录结构按算子域组织：
 
     ```
     tops/cpu/
@@ -75,17 +75,22 @@
     └── mla/          # MLA 参考实现的对比测试
     ```
 
-*   **对齐要求**：所有新增到 `tops/ops/` 的 Pallas/JAX 实现，必须与 `tops/cpu/` 对齐并通过对照测试。
+*   **对齐要求**：所有新增到 `tops/ops/` 的 Pallas/JAX 实现（GPU 或 TPU），必须与 `tops/cpu/` 高精度参考实现对齐并通过对照测试。
 *   **Reference 正确性来源**：`tops/cpu/` 的正确性应通过 `tests/ref/` 中与 `torch_gpu/torch_cpu` 的对比持续校验，确保其可作为可信基线。
 
-### 3.2 算子与层级测试 (Operator & Layer Tests)
+### 3.2 算子正确性验证方法 (Kernel Correctness Methodology)
 
-*   在 `tests/` 目录下的测试类型被严格限制为以下两类标准的对比（Reference）：
-    1.  **CPU 参考对比测试 (vs JAX-CPU)**：将 Pallas 内核的输出和梯度，与 `tops/cpu/` 中纯 JAX 编写的参考实现做容差（Tolerances）检查。
-    2.  **GPU 参考对比测试 (vs Torch-GPU/Triton)**：将 Pallas 内核与已知正确、跨框架计算库（如基于 PyTorch 编写或者 FlashAttention 等现有高优组件）在同等硬件条件下的计算结果进行对齐。
-*   **`tests/ops/`**：底层算子的修改（如 Pallas 内核的调度优化），必须采用上述两类对照测试验证结果或梯度容差，绝不可越权依赖高层级（如层的 `test_gla.py`）来变相验证。
+所有 Kernel 的正确性验证统一以 `tops/cpu/` 中**高精度 JAX CPU 参考实现**作为唯一 Golden 基准。GPU 和 TPU 实现分别与该基准进行容差对比，并强制要求 TPU 的误差不得高于 GPU 的误差：
+
+1.  **GPU 对比测试 (GPU vs High-Precision CPU JAX)**：将 GPU 上的 Pallas/JAX 内核输出和梯度，与 `tops/cpu/` 中高精度纯 JAX 参考实现做容差检查，记录误差水平 $\epsilon_{\text{GPU}}$。
+2.  **TPU 对比测试 (TPU vs High-Precision CPU JAX)**：将 TPU 上的 Pallas 内核输出和梯度，与 `tops/cpu/` 中高精度纯 JAX 参考实现做容差检查，记录误差水平 $\epsilon_{\text{TPU}}$。
+3.  **误差上界约束（Error Bound Constraint）**：**TPU→CPU 的误差不得超过 GPU→CPU 的误差**，即必须满足 $\epsilon_{\text{TPU}} \leq \epsilon_{\text{GPU}}$。若 TPU 实现的误差高于 GPU 实现，则视为 TPU Kernel 存在精度缺陷，需修复。此约束确保 TPU Kernel 的数值精度至少与 GPU Kernel 持平。
+
+### 3.3 算子与层级测试 (Operator & Layer Tests)
+
+*   **`tests/ops/`**：底层算子的修改（如 Pallas 内核的调度优化），必须采用上述 GPU/TPU 对照测试验证结果或梯度容差，绝不可越权依赖高层级（如层的 `test_gla.py`）来变相验证。
 *   **`tests/modules/` & `tests/layers/`**：网络单元层级的修改必须有对应的集成封装和数据流验证测试。
-*   **默认对照对象与 GPU 例外规则**：默认测试与 `tops/cpu/` 参考实现比较；若需要做 GPU 对照（如 Torch/Triton），应单独新开测试文件，并在文件名增加 `_gpu` 后缀。
+*   **默认对照对象**：所有测试默认与 `tops/cpu/` 高精度参考实现比较。GPU 测试文件以 `_gpu` 后缀命名，TPU 测试文件以 `_tpu` 后缀命名。
 
 ---
 
