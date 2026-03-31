@@ -367,8 +367,11 @@ def chunk_gla_fwd_intra_gk_pl(
     b_k = k_ref[0, 0]  # (BT, K)
     b_g = g_ref[0, 0].astype(jnp.float32)  # (BT, K)
 
-    b_qg = (b_q * jnp.exp(b_g)).astype(b_q.dtype)
-    b_kg = (b_k * jnp.exp(-b_g)).astype(b_k.dtype)
+    # Midpoint stabilization: halves exponent range to prevent exp overflow
+    # at large chunk sizes. Identity: exp(g[i])*exp(-g[j]) = exp(g[i]-m)*exp(m-g[j])
+    g_mid = (b_g[0:1, :] + b_g[-1:, :]) * 0.5
+    b_qg = (b_q * jnp.exp(b_g - g_mid)).astype(b_q.dtype)
+    b_kg = (b_k * jnp.exp(g_mid - b_g)).astype(b_k.dtype)
 
     b_A = (
         jnp.dot(
@@ -630,16 +633,20 @@ def chunk_gla_bwd_dqk_intra_ref(
     gc_c = g_cumsum.reshape(B, NT, C, H, K)
     dA_c = dA.reshape(B, NT, C, H, C)
 
+    # Midpoint stabilization: halves exponent range to prevent exp overflow
+    # at large chunk sizes.  Identity: exp(g[i])*exp(-g[j]) = exp(g[i]-m)*exp(m-g[j])
+    g_mid = (gc_c[:, :, 0:1, :, :] + gc_c[:, :, -1:, :, :]) * 0.5
+
     # dq[i] = exp(gc[i]) * sum_{j<=i} dA[i,j] * k[j] * exp(-gc[j])
     # dA is already lower-triangular masked, so causal constraint is embedded
-    k_neg = k_c * jnp.exp(-gc_c)
-    dq = jnp.exp(gc_c) * jnp.einsum(
+    k_neg = k_c * jnp.exp(g_mid - gc_c)
+    dq = jnp.exp(gc_c - g_mid) * jnp.einsum(
         "bnihj,bnjhk->bnihk", dA_c, k_neg, precision=lax.Precision.HIGHEST
     )
 
     # dk[j] = exp(-gc[j]) * sum_{i>=j} dA[i,j] * q[i] * exp(gc[i])
-    q_pos = q_c * jnp.exp(gc_c)
-    dk = jnp.exp(-gc_c) * jnp.einsum(
+    q_pos = q_c * jnp.exp(gc_c - g_mid)
+    dk = jnp.exp(g_mid - gc_c) * jnp.einsum(
         "bnihj,bnihk->bnjhk", dA_c, q_pos, precision=lax.Precision.HIGHEST
     )
 
@@ -702,11 +709,16 @@ def chunk_gla_bwd_dqkg_ref(
 
     gn = gc_c[:, :, -1, :, :]  # [B, NT, H, K]
 
+    # Midpoint stabilization for inter-chunk dq to prevent exp overflow
+    g_mid = (gc_c[:, :, 0:1, :, :] + gc_c[:, :, -1:, :, :]) * 0.5
+
     # Inter-chunk dq: scale * exp(gc) * (do @ h^T over V)
+    # Split exp(gc) = exp(gc - g_mid) * exp(g_mid), absorb exp(g_mid) into h
+    h_scaled = h * jnp.exp(g_mid[:, :, 0, :, :])[:, :, :, :, None]
     dq_inter = (
         scale
-        * jnp.exp(gc_c)
-        * jnp.einsum("bnchv,bnhkv->bnchk", do_c, h, precision=lax.Precision.HIGHEST)
+        * jnp.exp(gc_c - g_mid)
+        * jnp.einsum("bnchv,bnhkv->bnchk", do_c, h_scaled, precision=lax.Precision.HIGHEST)
     )
 
     # Inter-chunk dk: exp(gn - gc) * (v @ dh^T over V)
@@ -723,6 +735,9 @@ def chunk_gla_bwd_dqkg_ref(
 
     # Gate gradient
     # dgk_inter = exp(gn) * sum_v(h * dh) + sum_t(dk_inter * k)
+    # Note: for negative g_gamma, exp(gn) underflows toward 0 (not NaN).
+    # This is mathematically correct — the gate gradient is small because the
+    # hidden state from the chunk start is mostly forgotten by the end.
     dgk_inter = jnp.exp(gn) * jnp.einsum(
         "bnhkv,bnhkv->bnhk", h, dh, precision=lax.Precision.HIGHEST
     ) + jnp.sum(dk_inter * k_c, axis=2)  # [B, NT, H, K]
@@ -1287,13 +1302,15 @@ def chunk_gla_fwd_o_gk_pl_kernel(
 
     # Inter-chunk: scale * (q * exp(g)) @ h
     b_g_f32 = b_g.astype(jnp.float32)
+    # Midpoint stabilization to prevent exp overflow at large chunk sizes
+    g_mid = (b_g_f32[0:1, :] + b_g_f32[-1:, :]) * 0.5
     if USE_EXP2:
-        b_qg = (b_q * jnp.exp2(b_g_f32)).astype(b_q.dtype)
+        b_qg = (b_q * jnp.exp2(b_g_f32 - g_mid)).astype(b_q.dtype)
     else:
-        b_qg = (b_q * jnp.exp(b_g_f32)).astype(b_q.dtype)
+        b_qg = (b_q * jnp.exp(b_g_f32 - g_mid)).astype(b_q.dtype)
     b_o = jnp.dot(
         b_qg,
-        b_h.astype(b_qg.dtype),
+        (b_h * jnp.exp(g_mid[0, :])[:, None]).astype(b_qg.dtype),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
@@ -1438,6 +1455,12 @@ def chunk_gla_bwd_fused_kernel(
 
     b_gn = b_g[BT - 1, :]
 
+    # Midpoint stabilization: halves exponent range to prevent exp overflow
+    # at large chunk sizes. Identity: exp(g[i])*exp(-g[j]) = exp(g[i]-m)*exp(m-g[j])
+    g_mid = (b_g[0:1, :] + b_g[-1:, :]) * 0.5
+    exp_g_s = jnp.exp(b_g - g_mid)      # stable exp(g), bounded by exp(range/2)
+    exp_neg_g_s = jnp.exp(g_mid - b_g)  # stable exp(-g), bounded by exp(range/2)
+
     # 1. dA = do @ v^T * scale  (gradient of loss w.r.t. A; used for dq, dk)
     b_A_do = b_do.astype(b_v.dtype)
     b_dA = jnp.dot(b_A_do, b_v.T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * scale
@@ -1453,15 +1476,15 @@ def chunk_gla_bwd_fused_kernel(
     dv_ref[0, 0] = b_dv.astype(dv_ref.dtype)
 
     # 3. dq
-    k_neg = (b_k * jnp.exp(-b_g)).astype(b_k.dtype)
-    b_dq_intra = jnp.dot(b_dA.astype(k_neg.dtype), k_neg, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * jnp.exp(b_g)
-    b_dq_inter = jnp.dot(b_do, b_h.astype(b_do.dtype).T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * (scale * jnp.exp(b_g))
+    k_neg = (b_k * exp_neg_g_s).astype(b_k.dtype)
+    b_dq_intra = jnp.dot(b_dA.astype(k_neg.dtype), k_neg, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * exp_g_s
+    b_dq_inter = jnp.dot(b_do, (b_h * jnp.exp(g_mid[0, :])[:, None]).astype(b_do.dtype).T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * (scale * exp_g_s)
     b_dq = b_dq_intra + b_dq_inter
     dq_ref[0, 0] = b_dq.astype(dq_ref.dtype)
 
     # 4. dk
-    q_pos = (b_q * jnp.exp(b_g)).astype(b_q.dtype)
-    b_dk_intra = jnp.dot(b_dA.T.astype(q_pos.dtype), q_pos, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * jnp.exp(-b_g)
+    q_pos = (b_q * exp_g_s).astype(b_q.dtype)
+    b_dk_intra = jnp.dot(b_dA.T.astype(q_pos.dtype), q_pos, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * exp_neg_g_s
     b_dk_inter = jnp.dot(b_v, b_dh.astype(b_v.dtype).T, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32) * jnp.exp(b_gn[None, :] - b_g)
     b_dk = b_dk_intra + b_dk_inter
     dk_ref[0, 0] = b_dk.astype(dk_ref.dtype)
