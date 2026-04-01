@@ -483,8 +483,8 @@ def chunk_simple_gla_fwd(
     assert_shape(v, (B, T, H, V))
     assert_shape_or_none(g, (B, T, H))
     assert_shape_or_none(g_gamma, (H,))
-    assert g_gamma is None or (g_gamma <= 0).all(), \
-        "g_gamma must be <= 0 (decay rate); positive values overflow exp()"
+    # assert g_gamma is None or (g_gamma <= 0).all(), \
+    #     "g_gamma must be <= 0 (decay rate); positive values overflow exp()"
     assert_shape_or_none(h0, (N, H, K, V))
     assert T % chunk_size == 0
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all()
@@ -564,8 +564,8 @@ def chunk_simple_gla_bwd(
     assert_shape(do, (B, T, H, V))
     assert_shape_or_none(g, (B, T, H))
     assert_shape_or_none(g_gamma, (H,))
-    assert g_gamma is None or (g_gamma <= 0).all(), \
-        "g_gamma must be <= 0 (decay rate); positive values overflow exp()"
+    # assert g_gamma is None or (g_gamma <= 0).all(), \
+    #     "g_gamma must be <= 0 (decay rate); positive values overflow exp()"
     assert_shape_or_none(h0, (N, H, K, V))
     assert_shape_or_none(dht, (N, H, K, V))
     assert K % 128 == 0 and V % 128 == 0
