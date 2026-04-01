@@ -32,9 +32,11 @@ def fused_chunk_simple_gla_fwd(
     *,
     g: jax.Array | None = None,         # [B, T, H]  chunk-local cumsum of scalar gate
     g_gamma: jax.Array | None = None,   # [H]         per-head fixed decay rate
-    h0: jax.Array | None = None,        # [B, H, K, V] initial hidden state
     scale: float | None = None,
+    h0: jax.Array | None = None,        # [B, H, K, V] initial hidden state
     use_ht: bool = False,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
     interpret: bool | None = None,
 ):
@@ -310,9 +312,11 @@ def fused_chunk_simple_gla_bwd(
     *,
     g: jax.Array | None = None,          # [B, T, H]  (must be None)
     g_gamma: jax.Array | None = None,    # [H]  per-head fixed decay rate
+    scale: float | None = None,
     h0: jax.Array | None = None,         # [B, H, K, V] initial hidden state
     dht: jax.Array | None = None,        # [B, H, K, V] terminal state gradient
-    scale: float | None = None,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
     interpret: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:

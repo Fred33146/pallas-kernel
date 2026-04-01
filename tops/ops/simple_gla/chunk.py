@@ -474,6 +474,7 @@ def chunk_simple_gla_fwd(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
+    interpret: bool | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
     B, T, H, K, V = *q.shape, v.shape[-1]
     N = cu_seqlens_cpu.shape[0] - 1 if cu_seqlens_cpu is not None else B
@@ -532,6 +533,7 @@ def chunk_simple_gla_bwd(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
+    interpret: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
     """Simple GLA backward orchestrator (g_gamma only).
 
