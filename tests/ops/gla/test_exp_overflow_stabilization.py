@@ -21,6 +21,7 @@ import numpy as np
 
 from tops.ops.gla.chunk import (
     chunk_gla_fwd_intra_gk_ref,
+    chunk_gla_bwd,
     chunk_gla_bwd_dA_ref,
     chunk_gla_bwd_dv_ref,
     chunk_gla_bwd_dqk_intra_ref,
@@ -168,6 +169,52 @@ def test_midpoint_handles_larger_range_than_first_element():
     A_mid = qg_mid @ kg_mid.T
     assert not jnp.any(jnp.isnan(A_mid)), "Midpoint-stabilized A contains NaN"
     assert not jnp.any(jnp.isinf(A_mid)), "Midpoint-stabilized A contains Inf"
+
+
+# ============================================================================
+# Test: constant g_gamma (Simple GLA scenario) at chunk_size=128
+# ============================================================================
+
+@pytest.mark.parametrize("g_gamma_val", [-0.5, -0.8, -1.0])
+def test_constant_g_gamma_bwd_no_nan(g_gamma_val):
+    """Backward with constant g_gamma (Simple GLA) should not NaN at BT=128.
+
+    This reproduces the exact scenario from the AL model CI failure:
+    g_gamma is a constant per-head scalar, broadcast to full (B, T, H, K).
+    """
+    B, T, H, K = 1, 256, 2, 128
+    V = K
+    C = 128
+    NT = T // C
+    scale = K**-0.5
+
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 5)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.float32)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.float32)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.float32)
+    do = jax.random.normal(keys[3], (B, T, H, V), dtype=jnp.float32)
+
+    # Constant g_gamma — reshape to (1,1,H,1) for broadcast compatibility
+    g_gamma = jnp.full((1, 1, H, 1), g_gamma_val, dtype=jnp.float32)
+
+    dq, dk, dv, dg, _dh0 = chunk_gla_bwd(
+        q, k, v,
+        g=None, g_gamma=g_gamma, g_cumsum=None,
+        scale=scale, initial_state=None,
+        h=None, A=None,
+        do=do, dht=None,
+        chunk_size=C,
+    )
+
+    for name, arr in [("dq", dq), ("dk", dk), ("dv", dv), ("dg", dg)]:
+        assert not jnp.any(jnp.isnan(arr)), (
+            f"{name} contains NaN (g_gamma={g_gamma_val}, chunk_size={C})"
+        )
+        assert not jnp.any(jnp.isinf(arr)), (
+            f"{name} contains Inf (g_gamma={g_gamma_val}, chunk_size={C})"
+        )
 
 
 if __name__ == "__main__":

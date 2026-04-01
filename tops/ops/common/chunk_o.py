@@ -59,15 +59,20 @@ def _chunk_fwd_o_kernel(
     if g_ref is not None:
         b_g = g_ref[0, 0].astype(jnp.float32)  # (BT,)
         b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        g_diff = b_g[:, None] - b_g[None, :]
+        fwd_mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+        safe_g_diff = jnp.where(fwd_mask, g_diff, 0.0)
+        b_A = b_A * exp(safe_g_diff)
 
     if g_gamma_ref is not None:
         head_idx = pl.program_id(0)
         b_gamma = g_gamma_ref[head_idx].astype(jnp.float32)
         b_g_gamma = b_gamma * (jnp.arange(BT) + 1).astype(jnp.float32)
         b_o = b_o * exp(b_g_gamma)[:, None]
-        _mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
-        b_A = b_A * jnp.exp(jnp.where(_mask, b_g_gamma[:, None] - b_g_gamma[None, :], 0.0))
+        g_gamma_diff = b_g_gamma[:, None] - b_g_gamma[None, :]
+        fwd_mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+        safe_g_gamma_diff = jnp.where(fwd_mask, g_gamma_diff, 0.0)
+        b_A = b_A * exp(safe_g_gamma_diff)
 
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
     b_A = jnp.where(mask, b_A, 0.0)
@@ -207,8 +212,10 @@ def chunk_simple_gla_bwd_kernel(
     # Recompute A in-kernel: A = (q @ k^T) * scale * decay
     pos = (jnp.arange(BT) + 1).astype(jnp.float32)
     mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
-    g_diff = b_gamma * (pos[:, None] - pos[None, :])
-    decay = jnp.exp(jnp.where(mask, g_diff, 0.0))
+    # Clamp exponent to 0 in upper triangle before exp() to avoid
+    # float32 overflow (exp(|gamma|*127) > 3.4e38 when |gamma| > 0.69).
+    safe_diff = jnp.where(mask, b_gamma * (pos[:, None] - pos[None, :]), 0.0)
+    decay = jnp.exp(safe_diff)
     b_a = jnp.dot(
         b_q, b_k.T,
         preferred_element_type=jnp.float32,
@@ -236,13 +243,11 @@ def chunk_simple_gla_bwd_kernel(
     b_dv = b_dv_intra + b_dv_inter
     dv_ref[0, 0] = b_dv.astype(dv_ref.dtype)
 
-    # Apply gating to dA: exp(g_i - g_j)
-    b_g_diff = b_g[:, None] - b_g[None, :]
-    b_dA_gated = jnp.where(
-        mask,
-        b_dA * jnp.exp(jnp.where(mask, b_g_diff, 0.0)),
-        0.0,
-    )
+    # Apply gating to dA using stable difference pattern: exp(g_i - g_j)
+    # Clamp exponent in upper triangle to 0 before exp() to prevent
+    # 0 * Inf = NaN (b_dA is zero in upper triangle from masking above).
+    safe_g_diff = jnp.where(mask, b_g[:, None] - b_g[None, :], 0.0)
+    b_dA_gated = b_dA * jnp.exp(safe_g_diff)
 
     # 3. dq = gated_dA @ k + do @ h^T * scale * exp(b_g)
     b_dq_intra = jnp.dot(b_dA_gated.astype(b_k.dtype), b_k,

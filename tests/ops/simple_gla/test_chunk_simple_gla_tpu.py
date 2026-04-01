@@ -19,7 +19,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd, chunk_simple_gla_bwd
+from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd, chunk_simple_gla_bwd, chunk_simple_gla
 from tops.cpu.ops.simple_gla import chunk_simple_gla_fwd as cpu_chunk_simple_gla_fwd
 from tops.cpu.ops.simple_gla import chunk_simple_gla_bwd as cpu_chunk_simple_gla_bwd
 from tests.utils import compare_tensor
@@ -66,6 +66,9 @@ FWD_CASES = [
     # ── multi-batch + long ──
     dict(B=4, T=256, H=2, K=128, V=128, seed=360, gate="g_gamma"),
     dict(B=2, T=256, H=4, K=128, V=128, seed=361, gate="g_gamma"),
+    # ── chunk_size=128 ──
+    dict(B=1, T=256, H=2, K=128, V=128, seed=800, gate="g_gamma", chunk_size=128),
+    dict(B=2, T=256, H=4, K=128, V=128, seed=801, gate="g_gamma", chunk_size=128),
 ]
 
 
@@ -78,6 +81,8 @@ def _fwd_case_id(c):
         parts.append("h0")
     if c.get("scale") is not None:
         parts.append(f"scale={c['scale']}")
+    if c.get("chunk_size") is not None:
+        parts.append(f"C={c['chunk_size']}")
     return "-".join(parts)
 
 
@@ -151,7 +156,8 @@ def _run_pallas_fwd(q, k, v, *, g_gamma=None, h0=None, scale=None,
 def test_chunk_fwd_vs_cpu(cfg):
     """chunk_simple_gla_fwd (Pallas) should match cpu chunk_simple_gla_fwd reference."""
     T = cfg["T"]
-    NT = T // CHUNK_SIZE
+    C = cfg.get("chunk_size", CHUNK_SIZE)
+    NT = T // C
     # Chunked accumulation introduces rounding differences; scale tolerance
     # with the number of chunks.
     # bf16 matmul accumulation order differs; errors compound across chunks.
@@ -165,8 +171,8 @@ def test_chunk_fwd_vs_cpu(cfg):
 
     q, k, v, g_gamma, h0 = _make_inputs(cfg, dtype=jnp.bfloat16)
 
-    o_ref, ht_ref = _run_cpu_chunk_fwd(q, k, v, g_gamma=g_gamma, h0=h0, scale=scale)
-    o_pl, ht_pl = _run_pallas_fwd(q, k, v, g_gamma=g_gamma, h0=h0, scale=scale)
+    o_ref, ht_ref = _run_cpu_chunk_fwd(q, k, v, g_gamma=g_gamma, h0=h0, scale=scale, chunk_size=C)
+    o_pl, ht_pl = _run_pallas_fwd(q, k, v, g_gamma=g_gamma, h0=h0, scale=scale, chunk_size=C)
 
     assert compare_tensor("output", o_ref, o_pl, atol=atol, rtol=rtol, max_ulp=max_ulp)
     if ht_ref is not None and ht_pl is not None:
@@ -200,6 +206,10 @@ BWD_CASES = [
     # ── longer ──
     dict(B=1, T=512, H=2, K=128, V=128, seed=700),
     dict(B=1, T=512, H=2, K=128, V=128, seed=701, h0=True, dht=True),
+    # ── chunk_size=128: exercises exp(gamma*(BT-1)) overflow boundary ──
+    dict(B=1, T=256, H=2, K=128, V=128, seed=800, chunk_size=128),
+    dict(B=2, T=256, H=4, K=128, V=128, seed=801, chunk_size=128),
+    dict(B=1, T=256, H=2, K=128, V=128, seed=802, chunk_size=128, h0=True),
 ]
 
 
@@ -209,6 +219,8 @@ def _bwd_case_id(c):
         parts.append("h0")
     if c.get("dht"):
         parts.append("dht")
+    if c.get("chunk_size") is not None:
+        parts.append(f"C={c['chunk_size']}")
     return "-".join(parts)
 
 
@@ -280,6 +292,142 @@ def test_chunk_bwd_vs_cpu(cfg):
     assert compare_tensor("dv", dv_ref, dv_pl, atol=atol, rtol=rtol, max_ulp=max_ulp)
     if dh0_ref is not None and dh0_pl is not None:
         assert compare_tensor("dh0", dh0_ref, dh0_pl, atol=atol, rtol=rtol, max_ulp=max_ulp)
+
+
+# ============================================================================
+# Backward NaN regression: chunk_size=128 with large |g_gamma|
+#
+# When |g_gamma| > 0.69 and chunk_size=128, exp(|gamma|*127) > exp(88.7)
+# which overflows float32.  The Toeplitz decay matrix exp(gamma*(i-j)) has
+# Inf in the upper triangle; 0 * Inf = NaN then leaks through jnp.where.
+# This test verifies the clamp-before-exp fix prevents NaN.
+# ============================================================================
+
+@pytest.mark.parametrize("g_gamma_val", [-0.5, -0.8, -1.0])
+def test_chunk_bwd_large_gamma_no_nan(g_gamma_val):
+    """Pallas backward should not produce NaN at chunk_size=128 with large |g_gamma|."""
+    B, T, H, K, V = 1, 256, 2, 128, 128
+    C = 128
+    scale = K**-0.5
+
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 5)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
+    do = jax.random.normal(keys[3], (B, T, H, V), dtype=jnp.bfloat16)
+
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+
+    dq, dk, dv, _dh0 = chunk_simple_gla_bwd(
+        q, k, v, do,
+        g_gamma=g_gamma,
+        scale=scale,
+        chunk_size=C,
+    )
+
+    for name, arr in [("dq", dq), ("dk", dk), ("dv", dv)]:
+        assert not jnp.any(jnp.isnan(arr)), (
+            f"{name} contains NaN (g_gamma={g_gamma_val}, chunk_size={C})"
+        )
+        assert not jnp.any(jnp.isinf(arr)), (
+            f"{name} contains Inf (g_gamma={g_gamma_val}, chunk_size={C})"
+        )
+
+
+# ============================================================================
+# End-to-end gradient NaN test: chunk_simple_gla (custom_vjp) with jax.grad
+#
+# Reproduces the exact flow used in ant-pretrain:
+# forward via chunk_simple_gla → backward via custom_vjp → check grads for NaN.
+# ============================================================================
+
+@pytest.mark.parametrize("g_gamma_val", [-0.3, -0.5, -0.8, -1.0])
+@pytest.mark.parametrize("chunk_size", [64, 128])
+def test_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
+    """End-to-end: jax.grad through chunk_simple_gla should not produce NaN."""
+    B, T, H, K, V = 1, 256, 2, 128, 128
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 3)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+
+    def loss_fn(q, k, v, g_gamma):
+        o, _ = chunk_simple_gla(q, k, v, g_gamma, chunk_size=chunk_size)
+        return o.sum()
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v, g_gamma)
+    dq, dk, dv = grads
+
+    for name, arr in [("dq", dq), ("dk", dk), ("dv", dv)]:
+        assert not jnp.any(jnp.isnan(arr)), (
+            f"{name} contains NaN (g_gamma={g_gamma_val}, chunk_size={chunk_size})"
+        )
+        assert not jnp.any(jnp.isinf(arr)), (
+            f"{name} contains Inf (g_gamma={g_gamma_val}, chunk_size={chunk_size})"
+        )
+
+
+# ============================================================================
+# Component-level NaN test: test each stage of backward individually
+# ============================================================================
+
+@pytest.mark.parametrize("g_gamma_val", [-0.5, -0.8])
+def test_chunk_bwd_components_no_nan(g_gamma_val):
+    """Test each backward component individually for NaN at chunk_size=128."""
+    B, T, H, K, V = 1, 256, 2, 128, 128
+    C = 128
+    scale = K**-0.5
+
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 5)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.float32)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.float32)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.float32)
+    do = jax.random.normal(keys[3], (B, T, H, V), dtype=jnp.float32)
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+
+    from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
+    from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
+
+    # Stage 1: chunk_fwd_h
+    h, _ = chunk_fwd_h(k=k, v=v, g=None, g_gamma=g_gamma, gk=None,
+                       h0=None, output_final_state=False, chunk_size=C,
+                       states_in_fp32=True)
+    assert not jnp.any(jnp.isnan(h)), f"h contains NaN (g_gamma={g_gamma_val})"
+    assert not jnp.any(jnp.isinf(h)), f"h contains Inf (g_gamma={g_gamma_val})"
+
+    # Stage 2: chunk_bwd_dh (with synthetic gk)
+    # Build gk from g_gamma the same way the forward pass does:
+    # g_cumsum = g_gamma * [1, 2, ..., C] tiled across time
+    pos = jnp.arange(1, C + 1, dtype=jnp.float32)
+    pos = jnp.tile(pos, T // C).reshape(1, T, 1, 1)
+    gk = jnp.broadcast_to(g_gamma.reshape(1, 1, H, 1) * pos, (B, T, H, K))
+    dh, _ = chunk_bwd_dh(q, k, v, g=None, g_gamma=None, gk=gk,
+                         do=do, dht=None, scale=scale,
+                         output_dh0=False, chunk_size=C,
+                         states_in_fp32=True)
+    assert not jnp.any(jnp.isnan(dh)), f"dh contains NaN (g_gamma={g_gamma_val})"
+    assert not jnp.any(jnp.isinf(dh)), f"dh contains Inf (g_gamma={g_gamma_val})"
+
+    # Stage 3: fused backward kernel
+    from tops.ops.common.chunk_o import chunk_simple_gla_bwd_o_pl
+    dq, dk, dv = chunk_simple_gla_bwd_o_pl(
+        q, k, v, g_gamma, h, do, dh,
+        scale=scale, chunk_size=C,
+    )
+    for name, arr in [("dq", dq), ("dk", dk), ("dv", dv)]:
+        assert not jnp.any(jnp.isnan(arr)), (
+            f"{name} contains NaN at stage 3 (g_gamma={g_gamma_val})"
+        )
+        assert not jnp.any(jnp.isinf(arr)), (
+            f"{name} contains Inf at stage 3 (g_gamma={g_gamma_val})"
+        )
 
 
 if __name__ == "__main__":

@@ -326,8 +326,9 @@ def chunk_gla_fwd_intra_gk_ref(
     k_c = k.reshape(B, NT, C, H, K)
     g_c = g.reshape(B, NT, C, H, K)
 
-    # Numerical stabilization: reference point g_n per chunk (first row)
-    g_n = g_c[:, :, 0:1, :, :]  # [B, NT, 1, H, K]
+    # Midpoint stabilization: halves exponent range to prevent exp overflow
+    # at large chunk sizes.  Identity: exp(g[i])*exp(-g[j]) = exp(g[i]-m)*exp(m-g[j])
+    g_n = (g_c[:, :, 0:1, :, :] + g_c[:, :, -1:, :, :]) * 0.5  # [B, NT, 1, H, K]
     q_gated = q_c * jnp.exp(g_c - g_n)
     k_gated = k_c * jnp.exp(g_n - g_c)
 
@@ -932,11 +933,14 @@ def chunk_gla_bwd(
         q,
         k,
         v,
-        g_cumsum,
-        do,
+        g=None,
+        g_gamma=None,
+        gk=g_cumsum,
+        do=do,
         h0=initial_state,
         dht=dht,
         scale=scale,
+        output_dh0=(initial_state is not None or dht is not None),
         cu_seqlens_cpu=cu_seqlens,
         chunk_size=C,
     )
