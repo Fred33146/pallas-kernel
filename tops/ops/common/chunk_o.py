@@ -205,7 +205,8 @@ def chunk_simple_gla_bwd_kernel(
 
     # Build per-position decay from g_gamma
     head_idx = pl.program_id(0)
-    b_gamma = g_gamma_ref[head_idx]
+    # tpu not support scalar bf16 mul
+    b_gamma = g_gamma_ref[head_idx].astype(jnp.float32)
     b_g = b_gamma * (jnp.arange(BT) + 1).astype(jnp.float32)  # [BT]
     b_gn = b_g[BT - 1]  # scalar — last position decay
 

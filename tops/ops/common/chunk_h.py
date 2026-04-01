@@ -66,7 +66,8 @@ def _chunk_fwd_h_kernel(
         v_tile = (v_tile * exp(b_g_scalar_last - b_g_scalar)[:, None]).astype(v_tile.dtype)
 
     if g_gamma is not None:
-        b_g_last = g_gamma[i_h] * jnp.minimum(BT, T - i_t * BT)
+        # tpu not support scalar bf16 mul
+        b_g_last = (g_gamma[i_h].astype(jnp.float32) * jnp.minimum(BT, T - i_t * BT)).astype(g_gamma.dtype)
         scratch_ref[...] *= exp(b_g_last)
         v_tile = (v_tile * exp(b_g_last - b_g)[:, None]).astype(v_tile.dtype)
 
@@ -715,7 +716,8 @@ def _chunk_bwd_dh_kernel(
 
     if g_gamma is not None:
         head_index = pl.program_id(0)
-        b_g_ramp = g_gamma[head_index] * (jnp.arange(0, BT) + 1)  # [BT]
+        # tpu not support scalar bf16 mul
+        b_g_ramp = (g_gamma[head_index].astype(jnp.float32) * (jnp.arange(0, BT) + 1)).astype(g_gamma.dtype)  # [BT]
 
     seq_idx = chunk_to_seq[i_t]
     eos = cu_seqlens_ref[seq_idx + 1]
@@ -746,7 +748,8 @@ def _chunk_bwd_dh_kernel(
 
     # per-head fixed decay (g_gamma)
     if g_gamma is not None:
-        b_g_last = g_gamma[head_index] * jnp.minimum(BT, eos - t0)
+        # tpu not support scalar bf16 mul
+        b_g_last = (g_gamma[head_index].astype(jnp.float32) * jnp.minimum(BT, eos - t0)).astype(g_gamma.dtype)
         b_dh *= exp(b_g_last)
         b_q = (b_q * exp(b_g_ramp)[:, None]).astype(b_q.dtype)
 

@@ -20,6 +20,9 @@ import jax
 import jax.numpy as jnp
 
 from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd, chunk_simple_gla_bwd, chunk_simple_gla
+from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
+from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
+from tops.ops.common.chunk_o import chunk_simple_gla_bwd_o_pl
 from tops.cpu.ops.simple_gla import chunk_simple_gla_fwd as cpu_chunk_simple_gla_fwd
 from tops.cpu.ops.simple_gla import chunk_simple_gla_bwd as cpu_chunk_simple_gla_bwd
 from tests.utils import compare_tensor
@@ -347,14 +350,14 @@ def test_chunk_bwd_large_gamma_no_nan(g_gamma_val):
 @pytest.mark.parametrize("chunk_size", [64, 128])
 def test_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
     """End-to-end: jax.grad through chunk_simple_gla should not produce NaN."""
-    B, T, H, K, V = 1, 256, 2, 128, 128
+    B, T, H, K, V = 8, 4096, 16, 128, 128
     key = jax.random.PRNGKey(42)
     keys = jax.random.split(key, 3)
 
     q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
     k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
     v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
-    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.bfloat16)
 
     def loss_fn(q, k, v, g_gamma):
         o, _ = chunk_simple_gla(q, k, v, g_gamma, chunk_size=chunk_size)
@@ -379,21 +382,19 @@ def test_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
 @pytest.mark.parametrize("g_gamma_val", [-0.5, -0.8])
 def test_chunk_bwd_components_no_nan(g_gamma_val):
     """Test each backward component individually for NaN at chunk_size=128."""
-    B, T, H, K, V = 1, 256, 2, 128, 128
+    B, T, H, K, V = 2, 4096, 16, 128, 128
     C = 128
     scale = K**-0.5
-
+    dtype = jnp.bfloat16
     key = jax.random.PRNGKey(42)
     keys = jax.random.split(key, 5)
 
-    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.float32)
-    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.float32)
-    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.float32)
-    do = jax.random.normal(keys[3], (B, T, H, V), dtype=jnp.float32)
-    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=dtype)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=dtype)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=dtype)
+    do = jax.random.normal(keys[3], (B, T, H, V), dtype=dtype)
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=dtype)
 
-    from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
-    from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
 
     # Stage 1: chunk_fwd_h
     h, _ = chunk_fwd_h(k=k, v=v, g=None, g_gamma=g_gamma, gk=None,
@@ -416,7 +417,6 @@ def test_chunk_bwd_components_no_nan(g_gamma_val):
     assert not jnp.any(jnp.isinf(dh)), f"dh contains Inf (g_gamma={g_gamma_val})"
 
     # Stage 3: fused backward kernel
-    from tops.ops.common.chunk_o import chunk_simple_gla_bwd_o_pl
     dq, dk, dv = chunk_simple_gla_bwd_o_pl(
         q, k, v, g_gamma, h, do, dh,
         scale=scale, chunk_size=C,
