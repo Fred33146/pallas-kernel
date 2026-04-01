@@ -19,9 +19,9 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from tops.ops.simple_gla.chunk import chunk_simple_gla_bwd, chunk_simple_gla
+from tops.ops.simple_gla.chunk import chunk_simple_gla
 
-from tops.ops.simple_gla.fused_chunk import fused_chunk_simple_gla_fwd
+from tops.ops.simple_gla.fused_chunk import fused_chunk_simple_gla_fwd, fused_chunk_simple_gla_bwd
 
 from tops.cpu.ops.simple_gla import chunk_simple_gla_fwd as cpu_chunk_simple_gla_fwd
 from tops.cpu.ops.simple_gla import chunk_simple_gla_bwd as cpu_chunk_simple_gla_bwd
@@ -273,7 +273,7 @@ def test_chunk_bwd_vs_cpu(cfg):
     )
 
     # Pallas chunk backward
-    dq_pl, dk_pl, dv_pl, dh0_pl = chunk_simple_gla_bwd(
+    dq_pl, dk_pl, dv_pl, dh0_pl = fused_chunk_simple_gla_bwd(
         q, k, v, do,
         g_gamma=g_gamma,
         scale=scale,
@@ -323,7 +323,7 @@ def test_chunk_bwd_large_gamma_no_nan(g_gamma_val):
 
     g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
 
-    dq, dk, dv, _dh0 = chunk_simple_gla_bwd(
+    dq, dk, dv, _dh0 = fused_chunk_simple_gla_bwd(
         q, k, v, do,
         g_gamma=g_gamma,
         scale=scale,

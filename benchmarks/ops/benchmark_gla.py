@@ -38,6 +38,7 @@ from tops.ops.simple_gla import (
     chunk_simple_gla_fwd,
     simple_gla_naive,
     fused_chunk_simple_gla_fwd,
+    fused_chunk_simple_gla_bwd,
 )
 
 # ---------------------------------------------------------------------------
@@ -213,6 +214,27 @@ def _run_provider(
         @jax.jit
         def run_bwd():
             return chunk_simple_gla_bwd(
+                q, k, v, do,
+                g_gamma=g_gamma, scale=scale,
+                h0=None, dht=None,
+                chunk_size=chunk_size,
+            )
+
+        fn = run_bwd
+    elif provider == "fused_simple_gla_chunk_bwd":
+        chunk_size = 64
+        if T % chunk_size != 0 or D % 128 != 0:
+            return None
+
+        # Forward pass first to get output for backward
+        o_fwd, _ = fused_chunk_simple_gla_fwd(
+            q, k, v, g_gamma=g_gamma, scale=scale, chunk_size=chunk_size,
+        )
+        do = jnp.ones_like(o_fwd)
+
+        @jax.jit
+        def run_bwd():
+            return fused_chunk_simple_gla_bwd(
                 q, k, v, do,
                 g_gamma=g_gamma, scale=scale,
                 h0=None, dht=None,
