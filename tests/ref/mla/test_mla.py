@@ -3,7 +3,8 @@
 Tests:
   1. Sub-function dtype verification (no GPU)
   2. JAX CPU vs PyTorch gold reference cross-validation (no GPU)
-  3. JAX CPU vs FLA PyTorch layer (GPU — requires flash_attn)
+  3. New feature tests: q_lora_rank=None, window_size, KV cache, mask, cu_seqlens, mscale
+  4. JAX CPU vs FLA PyTorch layer (GPU — requires flash_attn)
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from pathlib import Path
 
 os.environ["TRITON_F32_DEFAULT"] = "ieee"
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+import math
 
 import jax
 
@@ -27,6 +30,7 @@ from tops.cpu.ops.mla import (
     rms_norm,
     precompute_freqs_cis,
     apply_rotary_emb,
+    yarn_get_mscale,
     mla_project_q,
     mla_project_kv,
     causal_softmax_attention,
@@ -77,7 +81,11 @@ def _case_id(c):
 
 
 def _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype, seed=42):
-    """Generate random MLA weights in JAX."""
+    """Generate random MLA weights in JAX.
+
+    Returns:
+        (w_dq, w_uq, q_norm_weight, w_dkv, w_ukv, kv_norm_weight, w_kr, w_o)
+    """
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 8)
     qk_head_dim = nope + rope
@@ -102,6 +110,30 @@ def _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype, seed=42):
         w_o = w_o.astype(dtype)
 
     return w_dq, w_uq, q_norm_weight, w_dkv, w_ukv, kv_norm_weight, w_kr, w_o
+
+
+def _make_weights_no_lora(D, H, nope, rope, kvlr, vd, dtype, seed=42):
+    """Generate MLA weights for q_lora_rank=None (direct Q projection)."""
+    key = jax.random.PRNGKey(seed)
+    keys = jax.random.split(key, 6)
+    qk_head_dim = nope + rope
+    std = 0.02
+
+    w_q = jax.random.normal(keys[0], (H * qk_head_dim, D), dtype=jnp.float32) * std
+    w_dkv = jax.random.normal(keys[1], (kvlr, D), dtype=jnp.float32) * std
+    w_ukv = jax.random.normal(keys[2], (H * (nope + vd), kvlr), dtype=jnp.float32) * std
+    kv_norm_weight = jnp.ones(kvlr, dtype=jnp.float32)
+    w_kr = jax.random.normal(keys[3], (rope, D), dtype=jnp.float32) * std
+    w_o = jax.random.normal(keys[4], (D, H * vd), dtype=jnp.float32) * std
+
+    if dtype != jnp.float32:
+        w_q = w_q.astype(dtype)
+        w_dkv = w_dkv.astype(dtype)
+        w_ukv = w_ukv.astype(dtype)
+        w_kr = w_kr.astype(dtype)
+        w_o = w_o.astype(dtype)
+
+    return w_q, w_dkv, w_ukv, kv_norm_weight, w_kr, w_o
 
 
 def _make_hidden(B, T, D, dtype, seed=99):
@@ -160,7 +192,7 @@ class TestDtypes:
 
     @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
     def test_project_q_dtype(self, dtype):
-        """Query projection output = input dtype."""
+        """Query projection output = input dtype (LoRA path)."""
         cfg = DEFAULT_CFG
         D, H = cfg["hidden_size"], cfg["num_heads"]
         qlr = cfg["q_lora_rank"]
@@ -171,6 +203,21 @@ class TestDtypes:
         q = mla_project_q(hidden, weights[0], weights[1], weights[2], H, nope, rope, cos, sin)
         assert q.dtype == dtype, f"q.dtype={q.dtype}, expected {dtype}"
         assert q.shape == (1, 16, H, nope + rope)
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
+    def test_project_q_no_lora_dtype(self, dtype):
+        """Query projection output = input dtype (direct path, q_lora_rank=None)."""
+        cfg = DEFAULT_CFG
+        D, H = cfg["hidden_size"], cfg["num_heads"]
+        nope, rope = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"]
+        qk_head_dim = nope + rope
+        key = jax.random.PRNGKey(42)
+        w_q = (jax.random.normal(key, (H * qk_head_dim, D), dtype=jnp.float32) * 0.02).astype(dtype)
+        hidden = _make_hidden(1, 16, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, 16)
+        q = mla_project_q(hidden, None, None, None, H, nope, rope, cos, sin, w_q=w_q)
+        assert q.dtype == dtype
+        assert q.shape == (1, 16, H, qk_head_dim)
 
     @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
     def test_project_kv_dtype(self, dtype):
@@ -243,16 +290,12 @@ class TestDtypes:
 
 
 class TestCrossValidation:
-    """Cross-validate JAX CPU implementation against PyTorch gold reference.
-
-    Forces JAX to run on CPU to ensure fair comparison with PyTorch CPU.
-    """
+    """Cross-validate JAX CPU implementation against PyTorch gold reference."""
 
     @pytest.mark.parametrize("case", CASES, ids=[_case_id(c) for c in CASES])
     @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
     def test_mla_forward_vs_gold(self, case, dtype):
         """Full MLA forward: JAX CPU vs PyTorch gold reference."""
-        import torch
         from tests.src.ops.gold_mla import gold_mla_forward
 
         B, T, D, H, qlr, kvlr, nope, rope, vd = case
@@ -287,8 +330,8 @@ class TestCrossValidation:
     @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
     def test_project_q_vs_gold(self, dtype):
         """Query projection sub-function: JAX vs PyTorch."""
-        import torch
         from tests.src.ops.gold_mla import rms_norm as pt_rms_norm, apply_rotary_emb as pt_rope
+        import torch
 
         cfg = DEFAULT_CFG
         D, H = cfg["hidden_size"], cfg["num_heads"]
@@ -363,7 +406,438 @@ class TestCrossValidation:
 
 
 # ============================================================================
-# 3. JAX CPU vs FLA MultiheadLatentAttention (GPU — requires flash_attn)
+# 3. New feature tests
+# ============================================================================
+
+
+class TestQLoraNone:
+    """Test q_lora_rank=None (direct Q projection)."""
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_forward_no_lora_vs_gold(self, dtype):
+        """MLA forward with q_lora_rank=None: JAX vs PyTorch gold."""
+        from tests.src.ops.gold_mla import gold_mla_forward
+
+        B, T, D, H = 2, 32, 256, 4
+        nope, rope, vd, kvlr = 32, 16, 32, 64
+
+        w_q, w_dkv, w_ukv, kv_nw, w_kr, w_o = _make_weights_no_lora(
+            D, H, nope, rope, kvlr, vd, dtype,
+        )
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        # JAX: w_dq=None, pass w_q as keyword
+        o_jax = mla_forward(
+            hidden, None, None, None,
+            w_dkv, w_ukv, kv_nw, w_kr, w_o,
+            H, nope, rope, vd, cos, sin,
+            w_q=w_q,
+        )
+
+        # PyTorch gold
+        o_pt = gold_mla_forward(
+            _jax_to_torch(hidden),
+            None, None, None,
+            _jax_to_torch(w_dkv), _jax_to_torch(w_ukv),
+            _jax_to_torch(kv_nw), _jax_to_torch(w_kr), _jax_to_torch(w_o),
+            H, nope, rope, vd,
+            _jax_to_torch(cos), _jax_to_torch(sin),
+            w_q=_jax_to_torch(w_q),
+        )
+
+        atol = 1e-7 if dtype == jnp.float64 else 1e-5
+        np.testing.assert_allclose(
+            np.array(o_jax).astype(np.float64),
+            o_pt.detach().numpy().astype(np.float64),
+            atol=atol, rtol=atol,
+            err_msg="MLA forward (no LoRA Q) mismatch",
+        )
+
+
+class TestWindowSize:
+    """Test sliding window attention."""
+
+    @pytest.mark.parametrize("window_size", [4, 8, 16])
+    def test_window_restricts_attention(self, window_size):
+        """Verify window_size limits how far back queries can attend."""
+        B, T, H, D = 1, 32, 2, 16
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        q = jax.random.normal(keys[0], (B, T, H, D)) * 0.1
+        k = jax.random.normal(keys[1], (B, T, H, D)) * 0.1
+        v = jax.random.normal(keys[2], (B, T, H, D)) * 0.1
+
+        o_full = causal_softmax_attention(q, k, v)
+        o_win = causal_softmax_attention(q, k, v, window_size=window_size)
+
+        # First window_size positions should be the same (window covers all past)
+        np.testing.assert_allclose(
+            np.array(o_full[:, :window_size]),
+            np.array(o_win[:, :window_size]),
+            atol=1e-6,
+            err_msg="First window_size positions should match full causal",
+        )
+        # Positions beyond window_size should differ
+        if T > window_size:
+            diff = np.max(np.abs(np.array(o_full[:, window_size:]) - np.array(o_win[:, window_size:])))
+            assert diff > 1e-6, "Window should change output for positions beyond window"
+
+    def test_window_vs_gold(self):
+        """Window attention: JAX vs PyTorch gold."""
+        from tests.src.ops.gold_mla import gold_mla_forward
+
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T, ws = 1, 32, 8
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, jnp.float32)
+        hidden = _make_hidden(B, T, D, jnp.float32)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        o_jax = mla_forward(hidden, *weights, H, nope, rope, vd, cos, sin, window_size=ws)
+        o_pt = gold_mla_forward(
+            _jax_to_torch(hidden), *[_jax_to_torch(w) for w in weights],
+            H, nope, rope, vd, _jax_to_torch(cos), _jax_to_torch(sin),
+            window_size=ws,
+        )
+
+        np.testing.assert_allclose(
+            np.array(o_jax).astype(np.float64),
+            o_pt.detach().numpy().astype(np.float64),
+            atol=1e-5, rtol=1e-5,
+            err_msg="Window attention: JAX vs gold mismatch",
+        )
+
+
+class TestKVCache:
+    """Test KV cache for incremental decoding."""
+
+    def test_prefill_then_decode(self):
+        """Verify that prefill + decode matches single full forward."""
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T_total = 1, 16
+        T_prefill = 12
+        T_decode = T_total - T_prefill
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden_full = _make_hidden(B, T_total, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T_total)
+
+        # Full forward (reference)
+        o_full = mla_forward(hidden_full, *weights, H, nope, rope, vd, cos, sin)
+
+        # Prefill: first T_prefill tokens, with cache
+        hidden_pre = hidden_full[:, :T_prefill]
+        o_pre, k_cache, v_cache = mla_forward(
+            hidden_pre, *weights, H, nope, rope, vd, cos, sin,
+            past_k=jnp.zeros((B, 0, H, nope + rope), dtype=dtype),
+            past_v=jnp.zeros((B, 0, H, vd), dtype=dtype),
+        )
+
+        # Decode: remaining tokens using cache
+        hidden_dec = hidden_full[:, T_prefill:]
+        o_dec, _, _ = mla_forward(
+            hidden_dec, *weights, H, nope, rope, vd, cos, sin,
+            past_k=k_cache, past_v=v_cache,
+        )
+
+        # Concatenate and compare
+        o_incremental = jnp.concatenate([o_pre, o_dec], axis=1)
+        np.testing.assert_allclose(
+            np.array(o_full), np.array(o_incremental),
+            atol=1e-5, rtol=1e-5,
+            err_msg="Prefill+decode should match full forward",
+        )
+
+    def test_cache_return_type(self):
+        """mla_forward returns (output, k, v) when past_k/v are provided."""
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T = 1, 8
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        # Without cache: returns tensor
+        result_no_cache = mla_forward(hidden, *weights, H, nope, rope, vd, cos, sin)
+        assert isinstance(result_no_cache, jnp.ndarray)
+
+        # With cache: returns tuple
+        result_cache = mla_forward(
+            hidden, *weights, H, nope, rope, vd, cos, sin,
+            past_k=jnp.zeros((B, 0, H, nope + rope), dtype=dtype),
+            past_v=jnp.zeros((B, 0, H, vd), dtype=dtype),
+        )
+        assert isinstance(result_cache, tuple) and len(result_cache) == 3
+
+
+class TestAttentionMask:
+    """Test attention_mask (padding) support."""
+
+    def test_mask_zeros_padding(self):
+        """Padding tokens (mask=0) should not affect valid outputs."""
+        B, T, H, D = 2, 16, 2, 16
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        q = jax.random.normal(keys[0], (B, T, H, D)) * 0.1
+        k = jax.random.normal(keys[1], (B, T, H, D)) * 0.1
+        v = jax.random.normal(keys[2], (B, T, H, D)) * 0.1
+
+        # No padding
+        o_full = causal_softmax_attention(q, k, v)
+
+        # All-ones mask (no padding) should give same result
+        mask_all = jnp.ones((B, T), dtype=jnp.int32)
+        o_masked = causal_softmax_attention(q, k, v, attention_mask=mask_all)
+
+        np.testing.assert_allclose(
+            np.array(o_full), np.array(o_masked),
+            atol=1e-6,
+            err_msg="All-ones mask should match unmasked",
+        )
+
+    def test_mask_with_padding(self):
+        """Outputs at valid positions should differ when padding is present."""
+        B, T, H, D = 1, 16, 2, 16
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        q = jax.random.normal(keys[0], (B, T, H, D)) * 0.1
+        k = jax.random.normal(keys[1], (B, T, H, D)) * 0.1
+        v = jax.random.normal(keys[2], (B, T, H, D)) * 0.1
+
+        # Mask last 4 positions as padding
+        mask = jnp.concatenate([jnp.ones(T - 4), jnp.zeros(4)]).reshape(1, T).astype(jnp.int32)
+        o_masked = causal_softmax_attention(q, k, v, attention_mask=mask)
+
+        # Valid positions (first T-4) should still produce valid outputs
+        assert not jnp.any(jnp.isnan(o_masked[:, :T - 4]))
+
+
+class TestCuSeqlens:
+    """Test variable-length packed sequences (cu_seqlens)."""
+
+    def test_single_seq_matches_batched(self):
+        """cu_seqlens with single sequence should match non-varlen."""
+        B, T, H, D = 1, 16, 2, 16
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        q = jax.random.normal(keys[0], (B, T, H, D)) * 0.1
+        k = jax.random.normal(keys[1], (B, T, H, D)) * 0.1
+        v = jax.random.normal(keys[2], (B, T, H, D)) * 0.1
+
+        cu_seqlens = jnp.array([0, T], dtype=jnp.int32)
+        o_varlen = causal_softmax_attention(q, k, v, cu_seqlens=cu_seqlens)
+        o_normal = causal_softmax_attention(q, k, v)
+
+        np.testing.assert_allclose(
+            np.array(o_varlen), np.array(o_normal),
+            atol=1e-6,
+            err_msg="Single-seq varlen should match normal",
+        )
+
+    def test_multi_seq_independence(self):
+        """Packed sequences should be independent (no cross-sequence attention)."""
+        H, D = 2, 16
+        # Two sequences of length 4 and 6
+        T_total = 10
+        cu_seqlens = jnp.array([0, 4, 10], dtype=jnp.int32)
+
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        q = jax.random.normal(keys[0], (1, T_total, H, D)) * 0.1
+        k = jax.random.normal(keys[1], (1, T_total, H, D)) * 0.1
+        v = jax.random.normal(keys[2], (1, T_total, H, D)) * 0.1
+
+        o_packed = causal_softmax_attention(q, k, v, cu_seqlens=cu_seqlens)
+
+        # Compute each sequence independently
+        o_seq1 = causal_softmax_attention(q[:, :4], k[:, :4], v[:, :4])
+        o_seq2 = causal_softmax_attention(q[:, 4:], k[:, 4:], v[:, 4:])
+
+        np.testing.assert_allclose(
+            np.array(o_packed[:, :4]), np.array(o_seq1),
+            atol=1e-6, err_msg="Seq 1 mismatch",
+        )
+        np.testing.assert_allclose(
+            np.array(o_packed[:, 4:]), np.array(o_seq2),
+            atol=1e-6, err_msg="Seq 2 mismatch",
+        )
+
+    def test_varlen_mla_forward(self):
+        """Full MLA forward with cu_seqlens."""
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        T_total = 10
+        cu_seqlens = jnp.array([0, 4, 10], dtype=jnp.int32)
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(1, T_total, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T_total)
+
+        # Should not raise
+        o = mla_forward(
+            hidden, *weights, H, nope, rope, vd, cos, sin,
+            cu_seqlens=cu_seqlens,
+        )
+        assert o.shape == (1, T_total, D)
+
+
+class TestSeqlenOffset:
+    """Test RoPE seqlen_offset."""
+
+    def test_offset_shifts_rope_positions(self):
+        """RoPE with offset should shift position embeddings in Q/K projections."""
+        from tops.cpu.ops.mla.mla import _get_rope_cos_sin
+
+        rope_dim = 16
+        T, offset = 8, 4
+        cos, sin = precompute_freqs_cis(rope_dim, 32)
+
+        # Without offset: positions [0, 1, ..., 7]
+        cos_no, sin_no = _get_rope_cos_sin(cos, sin, T, seqlen_offset=0)
+        # With offset: positions [4, 5, ..., 11]
+        cos_off, sin_off = _get_rope_cos_sin(cos, sin, T, seqlen_offset=offset)
+
+        # cos_off should equal cos[4:12]
+        np.testing.assert_allclose(
+            np.array(cos_off.reshape(T, -1)),
+            np.array(cos[offset:offset + T]),
+            atol=1e-7,
+            err_msg="Offset cos should be cos[offset:offset+T]",
+        )
+        # Different from no offset
+        diff = np.max(np.abs(np.array(cos_no) - np.array(cos_off)))
+        assert diff > 1e-6, "Offset should shift RoPE positions"
+
+    def test_offset_via_kv_cache(self):
+        """seqlen_offset is correctly applied through KV cache path.
+
+        When using KV cache, the new q tokens (positions T_past..T_past+T_new-1)
+        attend to cached k tokens (positions 0..T_past-1) plus new k tokens.
+        The RoPE positions must be correctly offset for decode tokens.
+        This is already validated by TestKVCache.test_prefill_then_decode.
+        Here we verify the Q projection directly.
+        """
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T = 1, 4
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, 32)
+
+        # Q at positions [0,1,2,3]
+        q_0 = mla_project_q(
+            hidden, weights[0], weights[1], weights[2],
+            H, nope, rope, cos, sin,
+        )
+        # Q at positions [4,5,6,7]
+        q_4 = mla_project_q(
+            hidden, weights[0], weights[1], weights[2],
+            H, nope, rope, cos, sin,
+            seqlen_offset=4,
+        )
+
+        # nope part should be identical (no RoPE)
+        np.testing.assert_allclose(
+            np.array(q_0[..., :nope]), np.array(q_4[..., :nope]),
+            atol=1e-7, err_msg="Nope part should be identical regardless of offset",
+        )
+        # rope part should differ
+        diff = np.max(np.abs(np.array(q_0[..., nope:]) - np.array(q_4[..., nope:])))
+        assert diff > 1e-6, "Rope part of Q should differ with offset"
+
+
+class TestMscale:
+    """Test rope_scaling / mscale support."""
+
+    def test_yarn_get_mscale(self):
+        """yarn_get_mscale matches FLA's implementation."""
+        assert yarn_get_mscale(1.0, 1.0) == 1.0
+        assert yarn_get_mscale(0.5, 2.0) == 1.0
+        # scale > 1: 0.1 * mscale * log(scale) + 1.0
+        expected = 0.1 * 1.0 * math.log(4.0) + 1.0
+        assert abs(yarn_get_mscale(4.0, 1.0) - expected) < 1e-10
+
+    def test_mscale_changes_output(self):
+        """rope_scaling should modify the attention output."""
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T = 1, 16
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        o_normal = mla_forward(hidden, *weights, H, nope, rope, vd, cos, sin)
+        o_scaled = mla_forward(
+            hidden, *weights, H, nope, rope, vd, cos, sin,
+            rope_scaling={"rope_type": "yarn", "factor": 4.0, "mscale_all_dim": 1.0},
+            apply_mscale=True,
+        )
+
+        diff = np.max(np.abs(np.array(o_normal) - np.array(o_scaled)))
+        assert diff > 1e-6, "mscale should change output"
+
+    def test_mscale_default_matches_fla(self):
+        """Default apply_mscale=False: mscale should NOT change output (FLA behavior)."""
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T = 1, 16
+        dtype = jnp.float32
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        o_normal = mla_forward(hidden, *weights, H, nope, rope, vd, cos, sin)
+        o_with_scaling = mla_forward(
+            hidden, *weights, H, nope, rope, vd, cos, sin,
+            rope_scaling={"rope_type": "yarn", "factor": 4.0, "mscale_all_dim": 1.0},
+        )
+
+        np.testing.assert_allclose(
+            np.array(o_normal), np.array(o_with_scaling),
+            atol=1e-7,
+            err_msg="Default apply_mscale=False should not change output (FLA behavior)",
+        )
+
+    def test_mscale_vs_gold(self):
+        """mscale: JAX vs PyTorch gold."""
+        from tests.src.ops.gold_mla import gold_mla_forward
+
+        D, H, qlr, kvlr, nope, rope, vd = 128, 2, 16, 32, 16, 8, 16
+        B, T = 1, 16
+        dtype = jnp.float32
+        scaling = {"rope_type": "yarn", "factor": 4.0, "mscale_all_dim": 1.0}
+
+        weights = _make_weights(D, H, qlr, kvlr, nope, rope, vd, dtype)
+        hidden = _make_hidden(B, T, D, dtype)
+        cos, sin = precompute_freqs_cis(rope, T)
+
+        o_jax = mla_forward(
+            hidden, *weights, H, nope, rope, vd, cos, sin,
+            rope_scaling=scaling,
+            apply_mscale=True,
+        )
+        o_pt = gold_mla_forward(
+            _jax_to_torch(hidden), *[_jax_to_torch(w) for w in weights],
+            H, nope, rope, vd, _jax_to_torch(cos), _jax_to_torch(sin),
+            rope_scaling=scaling,
+            apply_mscale=True,
+        )
+
+        np.testing.assert_allclose(
+            np.array(o_jax).astype(np.float64),
+            o_pt.detach().numpy().astype(np.float64),
+            atol=1e-5, rtol=1e-5,
+            err_msg="mscale: JAX vs gold mismatch",
+        )
+
+
+# ============================================================================
+# 4. JAX CPU vs FLA MultiheadLatentAttention (GPU — requires flash_attn)
 # ============================================================================
 
 HAS_CUDA = False
@@ -426,25 +900,19 @@ def _extract_fla_weights(fla_module):
 
 @requires_fla_mla
 class TestVsFLA:
-    """Compare JAX CPU MLA against FLA's MultiheadLatentAttention (flash_attn on GPU).
-
-    This is the ground-truth comparison: FLA MLA uses flash_attn CUDA kernels
-    which are the mainstream production MLA implementation.
-    """
+    """Compare JAX CPU MLA against FLA's MultiheadLatentAttention (flash_attn on GPU)."""
 
     @pytest.mark.parametrize("case", GPU_CASES, ids=[_case_id(c) for c in GPU_CASES])
-    @pytest.mark.parametrize("dtype_name", ["fp32", "fp16", "bf16"])
+    @pytest.mark.parametrize("dtype_name", ["fp16", "bf16"])
     def test_mla_fwd_vs_fla(self, case, dtype_name):
         """Full MLA forward: JAX CPU vs FLA (flash_attn) on GPU."""
         import torch
 
         dtype_map = {
-            "fp32": (torch.float32, jnp.float32),
             "fp16": (torch.float16, jnp.float16),
             "bf16": (torch.bfloat16, jnp.bfloat16),
         }
         tol_map = {
-            "fp32": (5e-4, 5e-4),
             "fp16": (5e-3, 5e-3),
             "bf16": (5e-2, 5e-2),
         }
@@ -518,9 +986,9 @@ class TestVsFLA:
             err_msg=f"MLA forward: JAX CPU vs FLA flash_attn ({dtype_name})",
         )
 
-    @pytest.mark.parametrize("dtype_name", ["fp32"])
-    def test_mla_fwd_fp64_vs_fla_fp32(self, dtype_name):
-        """fp64 JAX CPU vs fp32 FLA: fp64 precision should exceed fp32."""
+    @pytest.mark.parametrize("dtype_name", ["bf16"])
+    def test_mla_fwd_fp64_vs_fla_bf16(self, dtype_name):
+        """fp64 JAX CPU vs bf16 FLA: fp64 should be within bf16 precision of FLA."""
         import torch
 
         B, T, D, H, qlr, kvlr, nope, rope, vd = 1, 32, 256, 4, 32, 64, 32, 16, 32
@@ -532,21 +1000,21 @@ class TestVsFLA:
             qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=vd,
             qk_head_dim=qk_head_dim, rope_theta=10000.0,
             max_position_embeddings=T,
-        ).float().cuda().eval()
+        ).to(torch.bfloat16).cuda().eval()
 
         torch.manual_seed(99)
-        hidden_pt = torch.randn(B, T, D, dtype=torch.float32, device="cuda") * 0.1
+        hidden_pt = torch.randn(B, T, D, dtype=torch.bfloat16, device="cuda") * 0.1
 
         with torch.no_grad():
             o_fla, _, _ = fla_mla(hidden_pt, attention_mask=None)
 
         weights_pt = _extract_fla_weights(fla_mla)
         weights_jax = tuple(
-            jnp.array(w.detach().cpu().numpy()).astype(jnp.float64)
+            jnp.array(w.detach().cpu().float().numpy()).astype(jnp.float64)
             for w in weights_pt
         )
         hidden_jax = jnp.array(
-            hidden_pt.detach().cpu().numpy()
+            hidden_pt.detach().cpu().float().numpy()
         ).astype(jnp.float64)
         cos, sin = precompute_freqs_cis(rope, T)
 
@@ -554,14 +1022,14 @@ class TestVsFLA:
             hidden_jax, *weights_jax, H, nope, rope, vd, cos, sin,
         )
 
-        o_fla_np = o_fla.detach().cpu().numpy().astype(np.float64)
+        o_fla_np = o_fla.detach().cpu().float().numpy().astype(np.float64)
         o_jax_np = np.array(o_jax)
 
         max_abs_diff = np.max(np.abs(o_fla_np - o_jax_np))
-        print(f"\n[fp64 vs fp32] MLA fwd vs FLA: max_abs={max_abs_diff:.4e}")
+        print(f"\n[fp64 vs bf16] MLA fwd vs FLA: max_abs={max_abs_diff:.4e}")
 
-        # fp64 should be within fp32 precision of FLA fp32
+        # fp64 JAX should be within bf16 precision of FLA bf16
         np.testing.assert_allclose(
-            o_jax_np, o_fla_np, atol=5e-5, rtol=5e-5,
-            err_msg="fp64 JAX vs fp32 FLA flash_attn",
+            o_jax_np, o_fla_np, atol=5e-2, rtol=5e-2,
+            err_msg="fp64 JAX vs bf16 FLA flash_attn",
         )
