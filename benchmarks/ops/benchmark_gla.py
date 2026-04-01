@@ -37,6 +37,7 @@ from tops.ops.simple_gla import (
     chunk_simple_gla_bwd,
     chunk_simple_gla_fwd,
     simple_gla_naive,
+    fused_chunk_simple_gla_fwd,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ ALL_PROVIDERS = [
     "fused_chunk",
     "simple_gla_naive",
     "simple_gla_chunk",
+    "fused_simple_gla_chunk",
     "fused_recurrent_bwd",
     "chunk_bwd",
     "fused_chunk_bwd",
@@ -186,6 +188,15 @@ def _run_provider(
             return None
         fn = partial(
             chunk_simple_gla_fwd, q, k, v,
+            g_gamma=g_gamma, scale=scale, chunk_size=chunk_size,
+        )
+    elif provider == "fused_simple_gla_chunk":
+        # chunk_simple_gla_fwd requires T % chunk_size == 0 and D % 128 == 0
+        chunk_size = 64
+        if T % chunk_size != 0 or D % 128 != 0:
+            return None
+        fn = partial(
+            fused_chunk_simple_gla_fwd, q, k, v,
             g_gamma=g_gamma, scale=scale, chunk_size=chunk_size,
         )
     elif provider == "simple_gla_chunk_bwd":

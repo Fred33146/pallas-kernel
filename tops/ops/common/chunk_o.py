@@ -37,7 +37,7 @@ def _chunk_fwd_o_kernel(
       q_ref/k_ref: (1, 1, BT, K)
       v_ref: (1, 1, BT, BV)
       h_ref: (1, 1, K, BV)
-      g_ref: (1, 1, BT) or None
+      g_ref: (1, 1, BT, 128) or None  (broadcast to 4D for TPU alignment)
       g_gamma_ref: [H] via SMEM or ANY
       scale_ref: (1,) via SMEM or ANY
       o_ref: (1, 1, BT, BV)
@@ -57,7 +57,7 @@ def _chunk_fwd_o_kernel(
     )
 
     if g_ref is not None:
-        b_g = g_ref[0, 0].astype(jnp.float32)  # (BT,)
+        b_g = g_ref[0, 0, :, 0].astype(jnp.float32)  # (BT,)
         b_o = b_o * exp(b_g)[:, None]
         g_diff = b_g[:, None] - b_g[None, :]
         fwd_mask = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
@@ -125,6 +125,7 @@ def _chunk_fwd_o_pl(
     _g = None
     if g is not None:
         _g = g.reshape(B, NT, BT, H).transpose(3, 0, 1, 2).reshape(H, total_NT, BT)
+        _g = jnp.broadcast_to(_g[:, :, :, None], (H, total_NT, BT, 128))  # 4D for TPU alignment
 
     BV = 128 if V % 128 == 0 else V
     num_v_tiles = V // BV
@@ -144,8 +145,8 @@ def _chunk_fwd_o_pl(
     spec_qk = pl.BlockSpec((1, 1, BT, K), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0, 0))
     spec_v = pl.BlockSpec((1, 1, BT, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
     spec_h = pl.BlockSpec((1, 1, K, BV), index_map=lambda hv_idx, nt_idx: (hv_idx, nt_idx, 0, 0))
-    spec_g = None if _g is None else pl.BlockSpec((1, 1, BT), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0))
     interpret = get_interpret()
+    spec_g = None if _g is None else pl.BlockSpec((1, 1, BT, 128), index_map=lambda hv_idx, nt_idx: (hv_idx // num_v_tiles, nt_idx, 0, 0))
     spec_gamma = None if g_gamma is None else pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
     spec_scale = pl.BlockSpec(memory_space=pltpu.ANY if interpret else pltpu.SMEM)
 
