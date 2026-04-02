@@ -17,6 +17,7 @@ The current package-level dependency tree (ordered bottom-up):
     *   **Dependency**: Generally not allowed to depend on any other packages in the repository.
 2.  **`tops/ops/`**
     *   **Responsibility**: Core operators and low-level compute kernel implementations (low-level hardware interactions at the Pallas TPU/GPU level), such as GLA and simple GLA variant kernels.
+    *   **Public API Surface**: All public interfaces are exported exclusively via `tops/ops/__init__.py`. Any interface not re-exported there is considered an internal implementation detail with **no API stability guarantee**.
     *   **Rules**: Highly optimized. Strictly forbidden from containing any logic related to business metrics (model training states, loss evaluation). Must be strongly associated with specific hardware features.
     *   **Dependency**: Recommended to only depend on `utils` or pure math/hardware primitives.
 3.  **`tops/modules/`**

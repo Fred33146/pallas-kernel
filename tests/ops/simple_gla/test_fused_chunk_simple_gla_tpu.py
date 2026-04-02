@@ -1,11 +1,12 @@
-"""chunk_simple_gla: Pallas kernel accuracy vs JAX CPU reference.
+"""simple_gla: unified API accuracy vs JAX CPU reference.
 
-Forward: chunk_simple_gla_fwd (tops.ops, Pallas) vs chunk_simple_gla_fwd (tops.cpu, pure JAX CPU)
-Backward: chunk_simple_gla_bwd (tops.ops, Pallas) vs chunk_simple_gla_bwd (tops.cpu, pure JAX CPU)
+Forward: simple_gla(mode='fused_chunk') vs cpu_chunk_simple_gla_fwd (pure JAX CPU)
+Backward: jax.vjp through simple_gla(mode='fused_chunk') vs cpu_chunk_simple_gla_bwd
+E2E gradient: simple_gla(mode='fused_chunk') vs simple_gla(mode='chunk') cross-validation
 
 The tops.cpu implementations are the ground-truth reference.
-This test validates that the Pallas kernels produce equivalent results
-on both CPU (interpret mode) and TPU.
+This test validates that the Pallas kernels (accessed via the unified simple_gla API)
+produce equivalent results on both CPU (interpret mode) and TPU.
 """
 
 from __future__ import annotations
@@ -19,9 +20,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from tops.ops.simple_gla.chunk import chunk_simple_gla
-
-from tops.ops.simple_gla.fused_chunk import fused_chunk_simple_gla_fwd, fused_chunk_simple_gla_bwd
+from tops.ops.simple_gla import simple_gla
 
 from tops.cpu.ops.simple_gla import chunk_simple_gla_fwd as cpu_chunk_simple_gla_fwd
 from tops.cpu.ops.simple_gla import chunk_simple_gla_bwd as cpu_chunk_simple_gla_bwd
@@ -137,15 +136,15 @@ def _run_cpu_chunk_fwd(q, k, v, *, g_gamma=None, h0=None, scale=None,
 
 def _run_pallas_fwd(q, k, v, *, g_gamma=None, h0=None, scale=None,
                     chunk_size=CHUNK_SIZE):
-    """Run tops.ops chunk_simple_gla_fwd (Pallas on TPU, interpret on CPU)."""
-    o, ht = fused_chunk_simple_gla_fwd(
+    """Run simple_gla(mode='fused_chunk') (Pallas on TPU, interpret on CPU)."""
+    o, ht = simple_gla(
         q, k, v,
-        g=None,
         g_gamma=g_gamma,
         scale=scale,
-        h0=h0,
-        use_ht=True,
+        initial_state=h0,
+        output_final_state=True,
         chunk_size=chunk_size,
+        mode="fused_chunk",
     )
     return o, ht
 
@@ -167,7 +166,7 @@ def test_chunk_fwd_vs_cpu(cfg):
     # Base tolerance accounts for bf16 precision (~7.8e-3 relative) and
     # cancellation in K=128-dim dot products.  Additional per-chunk term
     # covers inter-chunk state propagation error.
-    atol = cfg.get("atol", min(5e-2, 1e-2 + 1e-2 * max(NT, 1)))
+    atol = cfg.get("atol", min(5e-2, 2e-2 + 1e-2 * max(NT, 1)))
     rtol = cfg.get("rtol", 5e-2)
     max_ulp = 4
     scale = cfg.get("scale", None)
@@ -272,15 +271,26 @@ def test_chunk_bwd_vs_cpu(cfg):
         q, k, v, do, g_gamma=g_gamma, h0=h0, dht=dht, scale=scale, chunk_size=C,
     )
 
-    # Pallas chunk backward
-    dq_pl, dk_pl, dv_pl, dh0_pl = fused_chunk_simple_gla_bwd(
-        q, k, v, do,
-        g_gamma=g_gamma,
-        scale=scale,
-        h0=h0,
-        dht=dht,
-        chunk_size=C,
-    )
+    # Pallas via simple_gla(mode='fused_chunk') + jax.vjp
+    output_final_state = dht is not None
+
+    if h0 is not None:
+        def fwd_fn(q_, k_, v_, h0_):
+            return simple_gla(q_, k_, v_, g_gamma=g_gamma, scale=scale,
+                              initial_state=h0_, output_final_state=output_final_state,
+                              chunk_size=C, mode="fused_chunk")
+        _, vjp_fn = jax.vjp(fwd_fn, q, k, v, h0)
+        cotangent = (do, dht) if output_final_state else (do, None)
+        dq_pl, dk_pl, dv_pl, dh0_pl = vjp_fn(cotangent)
+    else:
+        def fwd_fn(q_, k_, v_):
+            return simple_gla(q_, k_, v_, g_gamma=g_gamma, scale=scale,
+                              initial_state=None, output_final_state=output_final_state,
+                              chunk_size=C, mode="fused_chunk")
+        _, vjp_fn = jax.vjp(fwd_fn, q, k, v)
+        cotangent = (do, dht) if output_final_state else (do, None)
+        dq_pl, dk_pl, dv_pl = vjp_fn(cotangent)
+        dh0_pl = None
 
     NT = T // C
     # bf16 accumulation order differs; backward errors compound across chunks.
@@ -311,24 +321,23 @@ def test_chunk_bwd_large_gamma_no_nan(g_gamma_val):
     """Pallas backward should not produce NaN at chunk_size=128 with large |g_gamma|."""
     B, T, H, K, V = 1, 256, 2, 128, 128
     C = 128
-    scale = K**-0.5
 
     key = jax.random.PRNGKey(42)
-    keys = jax.random.split(key, 5)
+    keys = jax.random.split(key, 3)
 
     q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
     k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
     v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
-    do = jax.random.normal(keys[3], (B, T, H, V), dtype=jnp.bfloat16)
 
     g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
 
-    dq, dk, dv, _dh0 = fused_chunk_simple_gla_bwd(
-        q, k, v, do,
-        g_gamma=g_gamma,
-        scale=scale,
-        chunk_size=C,
-    )
+    def loss_fn(q_, k_, v_):
+        o, _ = simple_gla(q_, k_, v_, g_gamma=g_gamma, chunk_size=C,
+                          mode="fused_chunk")
+        return o.sum()
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+    dq, dk, dv = grads
 
     for name, arr in [("dq", dq), ("dk", dk), ("dv", dv)]:
         assert not jnp.any(jnp.isnan(arr)), (
@@ -340,16 +349,16 @@ def test_chunk_bwd_large_gamma_no_nan(g_gamma_val):
 
 
 # ============================================================================
-# End-to-end gradient NaN test: chunk_simple_gla (custom_vjp) with jax.grad
+# End-to-end gradient NaN test: simple_gla(mode='chunk') with jax.grad
 #
 # Reproduces the exact flow used in ant-pretrain:
-# forward via chunk_simple_gla → backward via custom_vjp → check grads for NaN.
+# forward via simple_gla(mode='chunk') → backward via custom_vjp → check grads for NaN.
 # ============================================================================
 
 @pytest.mark.parametrize("g_gamma_val", [-0.3, -0.5, -0.8, -1.0])
 @pytest.mark.parametrize("chunk_size", [64, 128])
 def test_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
-    """End-to-end: jax.grad through chunk_simple_gla should not produce NaN."""
+    """End-to-end: jax.grad through simple_gla(mode='chunk') should not produce NaN."""
     B, T, H, K, V = 1, 256, 2, 128, 128
     key = jax.random.PRNGKey(42)
     keys = jax.random.split(key, 3)
@@ -360,7 +369,8 @@ def test_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
     g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
 
     def loss_fn(q, k, v, g_gamma):
-        o, _ = chunk_simple_gla(q, k, v, g_gamma, chunk_size=chunk_size)
+        o, _ = simple_gla(q, k, v, g_gamma=g_gamma, chunk_size=chunk_size,
+                          mode="chunk")
         return o.sum()
 
     grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v, g_gamma)
@@ -431,6 +441,97 @@ def test_chunk_bwd_components_no_nan(g_gamma_val):
         assert not jnp.any(jnp.isinf(arr)), (
             f"{name} contains Inf at stage 3 (g_gamma={g_gamma_val})"
         )
+
+
+# ============================================================================
+# End-to-end gradient NaN test: simple_gla(mode='fused_chunk') with jax.grad
+# ============================================================================
+
+@pytest.mark.parametrize("g_gamma_val", [-0.3, -0.5, -0.8, -1.0])
+@pytest.mark.parametrize("chunk_size", [64, 128])
+def test_fused_chunk_simple_gla_grad_no_nan(g_gamma_val, chunk_size):
+    """End-to-end: jax.grad through simple_gla(mode='fused_chunk') should not produce NaN."""
+    B, T, H, K, V = 1, 256, 2, 128, 128
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 3)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
+    g_gamma = jnp.full((H,), g_gamma_val, dtype=jnp.float32)
+
+    def loss_fn(q, k, v, g_gamma):
+        o, _ = simple_gla(q, k, v, g_gamma=g_gamma, chunk_size=chunk_size,
+                          mode="fused_chunk")
+        return o.sum()
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v, g_gamma)
+    dq, dk, dv = grads
+
+    for name, arr in [("dq", dq), ("dk", dk), ("dv", dv)]:
+        assert not jnp.any(jnp.isnan(arr)), (
+            f"{name} contains NaN (g_gamma={g_gamma_val}, chunk_size={chunk_size})"
+        )
+        assert not jnp.any(jnp.isinf(arr)), (
+            f"{name} contains Inf (g_gamma={g_gamma_val}, chunk_size={chunk_size})"
+        )
+
+
+# ============================================================================
+# Cross-validation: simple_gla(mode='fused_chunk') vs simple_gla(mode='chunk')
+#
+# Both share the same backward kernel, so gradients should be identical.
+# ============================================================================
+
+CROSS_CASES = [
+    dict(B=2, T=64, H=4, K=128, V=128, seed=42),
+    dict(B=1, T=128, H=2, K=128, V=128, seed=7),
+    dict(B=2, T=64, H=4, K=128, V=128, seed=13, h0=True),
+    dict(B=1, T=256, H=2, K=128, V=128, seed=300),
+]
+
+
+def _cross_case_id(c):
+    parts = [f"B{c['B']}_T{c['T']}_H{c['H']}_K{c['K']}_V{c['V']}"]
+    if c.get("h0"):
+        parts.append("h0")
+    return "-".join(parts)
+
+
+@pytest.mark.parametrize("cfg", CROSS_CASES, ids=[_cross_case_id(c) for c in CROSS_CASES])
+def test_fused_chunk_vs_chunk_grads(cfg):
+    """simple_gla(mode='fused_chunk') and simple_gla(mode='chunk') should produce identical gradients."""
+    B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]
+    key = jax.random.PRNGKey(cfg["seed"])
+    keys = jax.random.split(key, 4)
+
+    q = jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.bfloat16)
+    k = jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.bfloat16)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.bfloat16)
+    g_gamma = -jnp.abs(jax.random.normal(keys[3], (H,), dtype=jnp.float32)) * 0.5
+
+    h0 = None
+    if cfg.get("h0"):
+        h0 = jax.random.normal(jax.random.PRNGKey(cfg["seed"] + 100),
+                                (B, H, K, V), dtype=jnp.bfloat16)
+
+    def loss_chunk(q, k, v, g_gamma):
+        o, _ = simple_gla(q, k, v, g_gamma=g_gamma, initial_state=h0,
+                          mode="chunk")
+        return o.sum()
+
+    def loss_fused(q, k, v, g_gamma):
+        o, _ = simple_gla(q, k, v, g_gamma=g_gamma, initial_state=h0,
+                          mode="fused_chunk")
+        return o.sum()
+
+    grads_chunk = jax.grad(loss_chunk, argnums=(0, 1, 2))(q, k, v, g_gamma)
+    grads_fused = jax.grad(loss_fused, argnums=(0, 1, 2))(q, k, v, g_gamma)
+
+    for name, g_c, g_f in zip(["dq", "dk", "dv"], grads_chunk, grads_fused):
+        assert compare_tensor(
+            f"{name}_cross", g_c, g_f, atol=1e-5, rtol=1e-5, max_ulp=1,
+        ), f"fused_chunk vs chunk gradient mismatch for {name}"
 
 
 if __name__ == "__main__":

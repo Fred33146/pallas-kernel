@@ -1,4 +1,4 @@
-"""chunk_simple_gla: forward (Triton vs JAX) & backward (Triton vs JAX Pallas)."""
+"""chunk_simple_gla: forward (Triton vs JAX) & backward (Triton vs JAX) via unified simple_gla API."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from tops.ops.simple_gla.chunk import chunk_simple_gla_fwd, chunk_simple_gla_bwd
+from tops.ops import simple_gla
 from tests.utils import compare_tensor, torch_to_jax, make_alibi_g_gamma
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,27 +152,29 @@ def _run_triton_bwd(q, k, v, do, *, g=None, g_gamma=None, h0=None, dht=None,
 
 def _run_jax_fwd(q, k, v, *, g_gamma=None, h0=None, scale=None,
                  chunk_size=CHUNK_SIZE):
-    """Run JAX chunk_simple_gla_fwd."""
+    """Run JAX simple_gla forward (mode='chunk')."""
     q_j = torch_to_jax(q)
     k_j = torch_to_jax(k)
     v_j = torch_to_jax(v)
-    g_gamma_j = torch_to_jax(g_gamma) if g_gamma is not None else None
+    H = q.shape[2]
+    # mode='chunk' requires g_gamma; use zeros (no decay) when unset.
+    g_gamma_j = torch_to_jax(g_gamma) if g_gamma is not None else jnp.zeros(H, dtype=jnp.float32)
     h0_j = torch_to_jax(h0) if h0 is not None else None
 
-    o, ht = chunk_simple_gla_fwd(
+    o, ht = simple_gla(
         q_j, k_j, v_j,
-        g=None,
         g_gamma=g_gamma_j,
         scale=scale,
-        h0=h0_j,
-        use_ht=True,
+        initial_state=h0_j,
+        output_final_state=True,
         chunk_size=chunk_size,
+        mode="chunk",
     )
     return o, ht
 
 
 # ============================================================================
-# Parametrized test — Triton chunk (gold) vs JAX chunk
+# Parametrized test — Triton chunk (gold) vs JAX chunk via simple_gla
 # ============================================================================
 
 
@@ -211,7 +213,7 @@ def test_triton_chunk_vs_jax_chunk(cfg):
 
 
 # ============================================================================
-# Backward: JAX Pallas vs Triton (g_gamma only)
+# Backward: JAX simple_gla (mode='chunk') via jax.vjp vs Triton (g_gamma only)
 # ============================================================================
 
 BWD_CASES = [
@@ -250,7 +252,7 @@ def _bwd_case_id(c):
 
 @pytest.mark.parametrize("cfg", BWD_CASES, ids=[_bwd_case_id(c) for c in BWD_CASES])
 def test_simple_gla_bwd_gamma(cfg):
-    """JAX chunk_simple_gla_bwd should match Triton backward (g_gamma only)."""
+    """JAX simple_gla backward (mode='chunk') via jax.vjp should match Triton backward."""
     B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]
     scale = cfg.get("scale", K**-0.5)
     C = cfg.get("chunk_size", CHUNK_SIZE)
@@ -273,7 +275,7 @@ def test_simple_gla_bwd_gamma(cfg):
         g_gamma=g_gamma, h0=h0, dht=dht, scale=scale, chunk_size=C,
     )
 
-    # JAX Pallas
+    # JAX via simple_gla + jax.vjp
     q_j = torch_to_jax(q)
     k_j = torch_to_jax(k)
     v_j = torch_to_jax(v)
@@ -282,10 +284,25 @@ def test_simple_gla_bwd_gamma(cfg):
     h0_j = torch_to_jax(h0) if h0 is not None else None
     dht_j = torch_to_jax(dht) if dht is not None else None
 
-    dq_jax, dk_jax, dv_jax, dh0_jax = chunk_simple_gla_bwd(
-        q_j, k_j, v_j, do_j,
-        g_gamma=g_gamma_j, scale=scale, h0=h0_j, dht=dht_j, chunk_size=C,
-    )
+    output_final_state = dht is not None
+
+    if h0 is not None:
+        def fwd_fn(q_, k_, v_, h0_):
+            return simple_gla(q_, k_, v_, g_gamma=g_gamma_j, scale=scale,
+                              initial_state=h0_, output_final_state=output_final_state,
+                              chunk_size=C, mode="chunk")
+        _, vjp_fn = jax.vjp(fwd_fn, q_j, k_j, v_j, h0_j)
+        cotangent = (do_j, dht_j) if output_final_state else (do_j, None)
+        dq_jax, dk_jax, dv_jax, dh0_jax = vjp_fn(cotangent)
+    else:
+        def fwd_fn(q_, k_, v_):
+            return simple_gla(q_, k_, v_, g_gamma=g_gamma_j, scale=scale,
+                              initial_state=None, output_final_state=output_final_state,
+                              chunk_size=C, mode="chunk")
+        _, vjp_fn = jax.vjp(fwd_fn, q_j, k_j, v_j)
+        cotangent = (do_j, dht_j) if output_final_state else (do_j, None)
+        dq_jax, dk_jax, dv_jax = vjp_fn(cotangent)
+        dh0_jax = None
 
     default_atol = bf16_atol if dtype == torch.bfloat16 else fp32_atol
     default_rtol = bf16_rtol if dtype == torch.bfloat16 else fp32_rtol
@@ -300,7 +317,7 @@ def test_simple_gla_bwd_gamma(cfg):
 
 
 # ============================================================================
-# NaN stability: chunk_size=128 with realistic ALiBi g_gamma
+# NaN stability: chunk_size=128 with realistic ALiBi g_gamma via simple_gla
 # ============================================================================
 
 
@@ -327,20 +344,23 @@ def test_chunk128_no_nan(cfg):
     g_gamma = make_alibi_g_gamma(H, cfg["num_layers"], cfg["layer_idx"])
 
     key = jax.random.PRNGKey(cfg["seed"])
-    k1, k2, k3, k4 = jax.random.split(key, 4)
+    k1, k2, k3 = jax.random.split(key, 3)
     q = jax.random.normal(k1, (B, T, H, K), dtype=jnp.bfloat16)
     k_arr = jax.random.normal(k2, (B, T, H, K), dtype=jnp.bfloat16)
     v = jax.random.normal(k3, (B, T, H, V), dtype=jnp.bfloat16)
-    do = jax.random.normal(k4, (B, T, H, V), dtype=jnp.bfloat16)
 
     # Forward
-    o, _ = chunk_simple_gla_fwd(q, k_arr, v, g_gamma=g_gamma, chunk_size=128)
+    o, _ = simple_gla(q, k_arr, v, g_gamma=g_gamma, chunk_size=128, mode="chunk")
     assert not jnp.any(jnp.isnan(o)), f"NaN in forward (layer {cfg['layer_idx']})"
     assert not jnp.any(jnp.isinf(o)), f"Inf in forward (layer {cfg['layer_idx']})"
 
-    # Backward
-    dq, dk, dv, _ = chunk_simple_gla_bwd(q, k_arr, v, do, g_gamma=g_gamma, chunk_size=128)
-    for name, grad in [("dq", dq), ("dk", dk), ("dv", dv)]:
+    # Backward via jax.grad through simple_gla
+    def loss_fn(q_, k_, v_):
+        o, _ = simple_gla(q_, k_, v_, g_gamma=g_gamma, chunk_size=128, mode="chunk")
+        return o.sum()
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k_arr, v)
+    for name, grad in zip(("dq", "dk", "dv"), grads):
         assert not jnp.any(jnp.isnan(grad)), f"NaN in {name} (layer {cfg['layer_idx']})"
         assert not jnp.any(jnp.isinf(grad)), f"Inf in {name} (layer {cfg['layer_idx']})"
 

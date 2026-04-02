@@ -90,7 +90,7 @@ def prepare_chunk_indices(
     return jnp.stack([seq_ids, block_ids], axis=1)
 
 def assert_shape_or_none(x: jax.Array | list[jax.Array | None] | tuple[jax.Array | None, ...] | None,
-                         expected_shape: tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
+                         expected_shape: list[int] | tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
     """
     Concise helper to assert tensor shapes.
     Skips assertion for any element that is None.
@@ -109,7 +109,7 @@ def assert_shape_or_none(x: jax.Array | list[jax.Array | None] | tuple[jax.Array
         assert x.shape == expected_shape, f"[{name}] Expected shape {expected_shape}, got {x.shape}"
 
 def assert_shape(x: jax.Array | list[jax.Array] | tuple[jax.Array, ...],
-                 expected_shape: tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
+                 expected_shape: list[int] | tuple[int, ...], name: str | list[str] | tuple[str, ...] = "tensor"):
     """
     Concise helper to assert tensor shapes.
     Supports a single array or an iterable of arrays that should all match the expected shape.

@@ -393,3 +393,163 @@ def fused_chunk_simple_gla_bwd(
     )
 
     return dq, dk, dv, dh0
+
+
+# =========================================================================
+# Padding helpers (mirror chunk.py)
+# =========================================================================
+
+_KV_ALIGN = 128
+
+
+def _pad_axis(x: jax.Array, multiple: int, axis: int) -> jax.Array:
+    """Zero-pad tensor along *axis* so its size is a multiple of *multiple*."""
+    rem = x.shape[axis] % multiple
+    if rem == 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, multiple - rem)
+    return jnp.pad(x, pad_width)
+
+
+def _pad_inputs(q, k, v, h0, chunk_size):
+    """Pad T (axis 1) to chunk_size, K and V (axis -1) to _KV_ALIGN."""
+    q = _pad_axis(_pad_axis(q, chunk_size, 1), _KV_ALIGN, -1)
+    k = _pad_axis(_pad_axis(k, chunk_size, 1), _KV_ALIGN, -1)
+    v = _pad_axis(_pad_axis(v, chunk_size, 1), _KV_ALIGN, -1)
+    if h0 is not None:
+        h0 = _pad_axis(_pad_axis(h0, _KV_ALIGN, -2), _KV_ALIGN, -1)
+    return q, k, v, h0
+
+
+def _resolve_scale(scale: float | None, K: int) -> float:
+    return scale if scale is not None else K ** -0.5
+
+
+# =========================================================================
+# custom_vjp wrapper
+# =========================================================================
+
+
+def _fused_chunk_gla_fwd(
+    q, k, v, g_gamma, initial_state,
+    scale, output_final_state, chunk_size,
+):
+    """Forward rule: run fused_chunk_simple_gla_fwd and save residuals."""
+    dtype = q.dtype
+    T_orig, K_orig, V_orig = q.shape[1], q.shape[-1], v.shape[-1]
+    q_f32, k_f32, v_f32 = (x.astype(jnp.float32) for x in (q, k, v))
+    g_gamma_f32 = g_gamma.astype(jnp.float32)
+    h0_f32 = initial_state.astype(jnp.float32) if initial_state is not None else None
+    s = _resolve_scale(scale, K_orig)
+
+    q_f32, k_f32, v_f32, h0_f32 = _pad_inputs(q_f32, k_f32, v_f32, h0_f32, chunk_size)
+
+    o, ht = fused_chunk_simple_gla_fwd(
+        q_f32, k_f32, v_f32,
+        g_gamma=g_gamma_f32, scale=s, h0=h0_f32,
+        use_ht=output_final_state,
+        chunk_size=chunk_size,
+    )
+    o_out = o[:, :T_orig, :, :V_orig]
+    ht_out = ht[:, :, :K_orig, :V_orig].astype(dtype) if ht is not None else None
+    primals_out = (o_out.astype(dtype), ht_out if output_final_state else None)
+    residuals = (q_f32, k_f32, v_f32, g_gamma_f32, h0_f32, T_orig, K_orig, V_orig)
+    return primals_out, residuals
+
+
+def _fused_chunk_gla_bwd(
+    scale, output_final_state, chunk_size,
+    residuals, grad_outputs,
+):
+    """Backward rule: call fused_chunk_simple_gla_bwd to compute gradients."""
+    q_f32, k_f32, v_f32, g_gamma_f32, h0_f32, T_orig, K_orig, V_orig = residuals
+    do, dht = grad_outputs
+
+    qkv_dtype = do.dtype
+    s = _resolve_scale(scale, K_orig)
+
+    do = do.astype(jnp.float32)
+    do = _pad_axis(do, chunk_size, 1)
+    do = _pad_axis(do, _KV_ALIGN, -1)
+    if dht is not None:
+        dht = dht.astype(jnp.float32)
+        dht = _pad_axis(dht, _KV_ALIGN, -2)
+        dht = _pad_axis(dht, _KV_ALIGN, -1)
+
+    dq, dk, dv, dh0 = fused_chunk_simple_gla_bwd(
+        q_f32, k_f32, v_f32, do,
+        g_gamma=g_gamma_f32,
+        scale=s, h0=h0_f32,
+        dht=dht,
+        chunk_size=chunk_size,
+    )
+    dq = dq[:, :T_orig, :, :K_orig]
+    dk = dk[:, :T_orig, :, :K_orig]
+    dv = dv[:, :T_orig, :, :V_orig]
+    dg = jnp.zeros_like(g_gamma_f32)
+    if h0_f32 is None:
+        dh0 = None
+    else:
+        dh0 = dh0[:, :, :K_orig, :V_orig]
+    dq = dq.astype(qkv_dtype)
+    dk = dk.astype(qkv_dtype)
+    dv = dv.astype(qkv_dtype)
+    if dh0 is not None:
+        dh0 = dh0.astype(qkv_dtype)
+    return dq, dk, dv, dg, dh0
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
+def fused_chunk_simple_gla(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g_gamma: jax.Array,
+    initial_state: jax.Array | None = None,
+    scale: float | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Fused-chunk Simple GLA with custom_vjp support.
+
+    Fuses the hidden-state propagation into a single Pallas kernel so that
+    the full h tensor [B, NT, H, K, V] never materialises in HBM (forward),
+    and similarly fuses dh propagation on the backward pass.
+
+    Args:
+        q: [B, T, H, K] queries.
+        k: [B, T, H, K] keys.
+        v: [B, T, H, V] values.
+        g_gamma: Per-head constant log decay, shape ``[H]``.
+        initial_state: Optional [B, H, K, V] initial recurrent state.
+        scale: Attention scale (default ``K ** -0.5``).
+        output_final_state: Whether to return the final state.
+        chunk_size: Chunk/block size BT.
+
+    Returns:
+        ``(o, final_state)`` where ``o`` is ``[B, T, H, V]`` and
+        ``final_state`` is ``[B, H, K, V]`` or ``None``.
+    """
+    dtype = q.dtype
+    T_orig, K_orig, V_orig = q.shape[1], q.shape[-1], v.shape[-1]
+    q_f32, k_f32, v_f32 = (x.astype(jnp.float32) for x in (q, k, v))
+    g_gamma_f32 = g_gamma.astype(jnp.float32)
+    h0_f32 = initial_state.astype(jnp.float32) if initial_state is not None else None
+    s = _resolve_scale(scale, K_orig)
+
+    q_f32, k_f32, v_f32, h0_f32 = _pad_inputs(q_f32, k_f32, v_f32, h0_f32, chunk_size)
+
+    o, ht = fused_chunk_simple_gla_fwd(
+        q_f32, k_f32, v_f32,
+        g_gamma=g_gamma_f32, scale=s, h0=h0_f32,
+        use_ht=output_final_state,
+        chunk_size=chunk_size,
+    )
+    o = o[:, :T_orig, :, :V_orig]
+    if ht is not None:
+        ht = ht[:, :, :K_orig, :V_orig].astype(dtype)
+    return o.astype(dtype), (ht if output_final_state else None)
+
+
+fused_chunk_simple_gla.defvjp(_fused_chunk_gla_fwd, _fused_chunk_gla_bwd)
