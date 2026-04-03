@@ -233,6 +233,10 @@ BWD_CASES = [
     dict(B=1, T=128, H=2, K=128, V=128, seed=601, dht=True, **_tol(128, base_atol=5e-2, base_ulp=40)),
     dict(B=2, T=64, H=4, K=128, V=128, seed=602, h0=True, dht=True, **_tol(64, base_atol=5e-2, base_ulp=80)),
     dict(B=1, T=256, H=2, K=128, V=128, seed=603, h0=True, dht=True, **_tol(256, base_atol=5e-2, base_ulp=40)),
+    # ── longer sequences ──
+    dict(B=1, T=512, H=4, K=128, V=128, seed=500, **_tol(512, base_atol=5e-2, base_ulp=40)),
+    dict(B=1, T=512, H=4, K=128, V=128, seed=501, h0=True, **_tol(512, base_atol=5e-2, base_ulp=40)),
+    dict(B=1, T=512, H=4, K=128, V=128, seed=502, h0=True, dht=True, **_tol(512, base_atol=5e-2, base_ulp=40)),
 ]
 
 

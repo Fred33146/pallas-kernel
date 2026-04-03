@@ -104,7 +104,7 @@ jobs:
 
           # Wait for the Job controller to update conditions
           echo "Waiting for job completion status..."
-          if kubectl wait --for=condition=complete --timeout=60s "job/$JOB_NAME" 2>/dev/null; then
+          if kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" 2>/dev/null; then
             echo "TPU tests completed successfully!"
             exit 0
           fi
