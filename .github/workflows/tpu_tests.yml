@@ -99,16 +99,27 @@ jobs:
         run: |
           JOB_NAME="${{ steps.job.outputs.name }}"
 
-          # Stream logs (blocks until container exits)
-          kubectl logs -f "job/$JOB_NAME" -c jax-tpu || true
+          # 循环重连日志，直到 Pod 进入终态
+          for i in $(seq 1 20); do
+            POD=$(kubectl get pods -l "job-name=$JOB_NAME" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            PHASE=$(kubectl get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              echo "Pod finished with phase: $PHASE"
+              break
+            fi
+            echo "Streaming logs (attempt $i)..."
+            kubectl logs -f "job/$JOB_NAME" -c jax-tpu 2>/dev/null || true
+            sleep 5
+          done
 
           # Wait for the Job controller to update conditions
           echo "Waiting for job completion status..."
-          if kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" 2>/dev/null; then
+          if kubectl wait --for=condition=complete --timeout=1800s "job/$JOB_NAME" 2>/dev/null; then
             echo "TPU tests completed successfully!"
             exit 0
           fi
-          if kubectl wait --for=condition=failed --timeout=10s "job/$JOB_NAME" 2>/dev/null; then
+          if kubectl wait --for=condition=failed --timeout=30s "job/$JOB_NAME" 2>/dev/null; then
             echo "TPU tests failed!"
             exit 1
           fi
