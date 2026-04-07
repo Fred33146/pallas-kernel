@@ -10,9 +10,10 @@ High-performance JAX/Pallas TPU and GPU kernels for modern neural network archit
 
 ```bash
 # Install dependencies
-uv sync                      # Base install
-uv sync --extra gpu          # With GPU support (CUDA 12.6)
-uv sync --extra tpu          # With TPU support
+uv sync                           # Base install (with pytest)
+uv sync --extra dev               # With dev tools (ruff, pre-commit)
+uv sync --extra gpu               # GPU development
+uv sync --extra tpu               # TPU development
 
 # Run tests
 uv run pytest tests/ -v                                    # All tests

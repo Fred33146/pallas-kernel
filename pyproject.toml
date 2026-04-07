@@ -5,35 +5,29 @@ build-backend = "hatchling.build"
 [project]
 name = "tops"
 dynamic = ["version"]
-description = "JAX/Flax Pallas kernels for Gated Linear Attention (GLA)"
+description = "High-performance JAX/Pallas kernels for modern neural network architectures"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
     "einops>=0.8.2",
     "flax>=0.11.2",
-    "numpy>=2.4.2",
     "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pre-commit>=4.5.1",
-    "pytest>=9.0.2",
     "ruff>=0.15.0",
 ]
 gpu = [
     "torch",
-    "torchvision",
-    "jax[cuda12,gpu]>=0.6.2",
-    "flash-linear-attention[gpu]>=0.4.1",
+    "jax[cuda12]>=0.6.2",
+    "flash-linear-attention>=0.4.1",
 ]
 tpu = [
     "jax[tpu]>=0.8.1",
     "torch",
-]
-profile = [
-    "xprof==2.22.0",
 ]
 
 [[tool.uv.index]]
@@ -59,7 +53,6 @@ torch = [
     { index = "pytorch-cu126", extra = "gpu" },
     { index = "pytorch-cpu", extra = "tpu" },
 ]
-torchvision = [{ index = "pytorch-cu126", extra = "gpu" }]
 
 
 [tool.pytest.ini_options]

@@ -22,19 +22,22 @@ spec:
         - |
           set -ex
 
-          # 1. 准备 SSH 环境 (Secret 挂载通常是只读的，所以需要 cp 到家目录)
+          # 1. SSH setup (Secret mount is read-only, copy to home)
           mkdir -p ~/.ssh
           cp /etc/ssh-key/id_ed25519 ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          # 2. 扫描 GitHub 指纹避免交互式确认
+          # 2. Scan GitHub fingerprint to avoid interactive confirmation
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-          # pip install -U --pre jax jaxlib libtpu requests -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          # 3. Install uv
           pip install uv
 
-          # git clone https://github.com/primatrix/ant-pretrain.git
-          # cd ant-pretrain && git checkout feat/kda-with-kernel
+          # 4. Clone and setup project
+          git clone git@github.com:primatrix/pallas-kernel.git ~/pallas-kernel
+          cd ~/pallas-kernel
+          uv sync --extra tpu || pip install -e '.[tpu]'
+
           python -c 'import jax; print("Total TPU devices (cores):", jax.device_count())'
 
           sleep infinity
