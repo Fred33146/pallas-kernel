@@ -156,7 +156,7 @@ Key requirements:
 
 ## Kernel Design Requirements
 
-Every new or refactored Kernel **must** have a design document in `docs/design/` covering the following:
+Every new or refactored Kernel **must** have a design document in `docs/design-docs/ops/` covering the following:
 
 ### 1. Algorithm and Code Logic
 
@@ -194,7 +194,7 @@ The design document must include:
 
 ## Adding New Kernels
 
-1. Write a design document in `docs/design/` first.
+1. Write a design document in `docs/design-docs/ops/` first.
 2. Implement CPU reference in `tops/cpu/ops/<domain>/`.
 3. Submit CPU reference for **all-core-developer review** (see [Code Review Process](#reference-implementation-changes)).
 4. Implement GPU/TPU kernel in `tops/ops/<domain>/`.

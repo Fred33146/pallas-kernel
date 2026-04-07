@@ -57,7 +57,7 @@ from tops.modules.layernorm import RMSNorm
 
 ## Contributing
 
-We welcome contributions! Please read our [Contributing Guide](CONTRIBUTING.md) ([中文版](CONTRIBUTING.zh.md)) to get started.
+We welcome contributions! Please read our [Contributing Guide](CONTRIBUTING.md) to get started.
 
 ## License
 
