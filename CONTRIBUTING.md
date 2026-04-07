@@ -99,6 +99,64 @@ uv run pytest tests/ -v
 
 Pre-commit hooks will run `ruff check --fix`, `ruff format`, `trailing-whitespace`, and `check-added-large-files` automatically on each commit.
 
+## Issue Management
+
+### Title Convention
+
+All issue titles must start with a type prefix:
+
+| Prefix | Usage | Label |
+|--------|-------|-------|
+| `[Bug]` | Bug report | `bug` |
+| `[Feature]` | Feature request | `enhancement` |
+| `[Epic]` | Large milestone or roadmap | `epic` |
+| `[Perf]` | Performance issue or optimization | `performance` |
+| `[Design]` | Kernel design proposal | `design-proposal` |
+
+Issues without a prefix should have one added during triage.
+
+### Priority
+
+| Priority | Meaning | Response Time |
+|----------|---------|---------------|
+| `P0` | Blocking — affects core functionality or CI | Immediate |
+| `P1` | Important — must complete in current iteration | Start within a week |
+| `P2` | Improvement — can be scheduled for later | Planned |
+
+All new issues must be tagged with a priority label. Untagged issues default to `P2`.
+
+### Labels
+
+**Type labels:** `bug`, `enhancement`, `documentation`, `question`
+**Priority labels:** `P0`, `P1`, `P2`
+**Special types:** `epic`, `performance`, `design-proposal`, `cpu-ref`
+**Community labels:** `good first issue`, `help wanted`
+
+The `cpu-ref` label must be added to any issue or PR that modifies code under `tops/cpu/`.
+
+### Issue Lifecycle
+
+```
+Created → [Optional] Triage/Assign → In Development → PR linked (Closes #N) → Auto-closed on merge
+```
+
+- Use the appropriate [issue template](.github/ISSUE_TEMPLATE/) when creating an issue.
+- Include the title prefix and a priority label.
+- Assignees default to unset; assigned later by a maintainer or automation.
+- PRs should use `Closes #N` to link the related issue; the issue is auto-closed on merge.
+
+### Epic & Sub-issues
+
+- Epic issues use the `[Epic]` prefix and `epic` label.
+- Parent-child relationships are established via the GitHub Sub-issues API.
+- The Epic body should include a `- [ ] #N` checklist for progress tracking.
+- Each sub-issue should be independently completable with a single PR.
+- Epic issues are manually closed after all sub-issues are resolved.
+
+### Issue Types (Supplementary)
+
+The organization has configured GitHub Issue Types (Bug / Feature / Goal / Task / SubTask). Setting the appropriate type when creating an issue is optional. **Title prefixes and labels are mandatory** — Issue Types do not replace them.
+
 ## Code Review Process
 
 ### General Changes
