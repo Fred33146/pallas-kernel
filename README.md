@@ -55,6 +55,10 @@ from tops.layers.gla import GatedLinearAttention
 from tops.modules.layernorm import RMSNorm
 ```
 
+## Contributing
+
+We welcome contributions! Please read our [Contributing Guide](CONTRIBUTING.md) ([中文版](CONTRIBUTING.zh.md)) to get started.
+
 ## License
 
 Apache License 2.0
