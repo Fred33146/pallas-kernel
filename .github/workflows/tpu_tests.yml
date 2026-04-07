@@ -3,8 +3,12 @@ name: TPU Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
 
 concurrency:
   group: tpu-tests-${{ github.head_ref || github.ref_name }}
