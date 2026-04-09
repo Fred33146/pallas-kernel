@@ -6,8 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-# Ensure `tests/` parent (project root) is importable so that
-# ``from tests.src.…`` style imports work regardless of working directory.
+# Ensure project root is importable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
