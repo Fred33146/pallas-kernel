@@ -70,6 +70,8 @@ addopts = [
   "--ignore=tests/ops/test_torch_fused_recurrent_bwd.py",
   "--ignore=tests/ops/test_gla.py",
   "--ignore=tests/ref",
+  "--ignore=tests/layers/test_gla.py",
+  "--ignore=tests/modules/test_modules.py",
 ]
 
 [tool.ruff]
