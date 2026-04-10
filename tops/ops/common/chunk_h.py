@@ -25,7 +25,7 @@ def _chunk_fwd_h_kernel(
     h0_ref,  # [1, 1, BK, BV]
     gk_ref,  # [1, 1, BT, BK]
     g_ref,   # [1, 1, BT, 128]
-    g_gamma,  # [H]
+    g_gamma_ref,  # [H]
     h_ref,  # [1, NS, 1, BK, BV] outputs
     ht_ref,  # [1, 1, BK , BV]
     scratch_ref, #[BK, BV]
@@ -41,8 +41,8 @@ def _chunk_fwd_h_kernel(
     T = NT * BT
     i_b, i_h, i_k, i_v, i_t = pl.program_id(0), pl.program_id(1), pl.program_id(2),pl.program_id(3),pl.program_id(4)
 
-    if g_gamma is not None:
-        b_g = g_gamma[i_h].astype(jnp.float32) * (jnp.arange(0, BT) + 1)
+    if g_gamma_ref is not None:
+        b_g = g_gamma_ref[i_h].astype(jnp.float32) * (jnp.arange(0, BT) + 1)
 
     @pl.when(i_t == 0)
     def init():
@@ -65,9 +65,9 @@ def _chunk_fwd_h_kernel(
         scratch_ref[...] *= exp(b_g_scalar_last)                 # uniform decay
         v_tile = (v_tile * exp(b_g_scalar_last - b_g_scalar)[:, None]).astype(v_tile.dtype)
 
-    if g_gamma is not None:
+    if g_gamma_ref is not None:
         # tpu not support scalar bf16 mul
-        b_g_last = (g_gamma[i_h].astype(jnp.float32) * jnp.minimum(BT, T - i_t * BT)).astype(g_gamma.dtype)
+        b_g_last = (g_gamma_ref[i_h].astype(jnp.float32) * jnp.minimum(BT, T - i_t * BT)).astype(g_gamma_ref.dtype)
         scratch_ref[...] *= exp(b_g_last)
         v_tile = (v_tile * exp(b_g_last - b_g)[:, None]).astype(v_tile.dtype)
 
@@ -882,5 +882,233 @@ def chunk_bwd_dh_kernel(
     dh_all = dh_all.reshape(B, -1, H, K, V)
     dh0 = dh0.reshape(N, H, K, V) if dh0 is not None else None
     return dh_all, dh0
+
+
+def _chunk_fwd_h_kernel_varlen(
+    k_ref,  # [1, BT, BK]
+    v_ref,  # [1, BT, BV]
+    h0_ref,  # [N, 1, BK, BV]
+    gk_ref,  # [1, BT, BK]
+    g_gamma_ref, # [H,]
+    cu_seqlens_ref,  # [num_seq+1]
+    chunk_to_seq,  # [T_sum/BT]
+    h_ref,  # [NS, 1, BK, BV]
+    ht_ref,  # [N, 1, BK , BV]
+    scratch_ref, # [BK, BV]
+    *,
+    BT,
+    BS,
+):
+    BT, BK = k_ref.shape[1], k_ref.shape[2]
+    BV = v_ref.shape[2]
+
+    NTS = BS // BT
+    b_h_start = jnp.zeros((BK, BV), dtype=jnp.float32)
+
+    i_h, i_k, i_v, i_t = pl.program_id(0), pl.program_id(1), pl.program_id(2), pl.program_id(3)
+
+    if g_gamma_ref is not None:
+        b_g = g_gamma_ref[i_h].astype(jnp.float32) * (jnp.arange(0, BT) + 1)
+    t0 = i_t * BT
+
+    seq_idx = chunk_to_seq[i_t]
+
+    bos = cu_seqlens_ref[seq_idx]
+    eos = cu_seqlens_ref[seq_idx + 1]
+    @pl.when(bos != eos)
+    def _():
+        # reset h state
+        @pl.when(t0 == bos)
+        def reset_state():
+            if h0_ref is not None:
+                scratch_ref[...] =  h0_ref[seq_idx, 0].astype(scratch_ref.dtype)
+            else:
+                scratch_ref[...] =  b_h_start
+
+        # store intermediate state
+        @pl.when(i_t % NTS == 0)
+        def store_fn():
+            s_i = i_t // NTS
+            h_ref[s_i, 0] = scratch_ref[...].astype(h_ref.dtype)
+            return None
+
+        k_tile = k_ref[(0, slice(None), slice(None))]  # [BT,BK]
+        v_tile = v_ref[(0, slice(None), slice(None))]  # [BT,BV]
+
+        if g_gamma_ref is not None:
+            # tpu not support scalar bf16 mul
+            b_g_last = (g_gamma_ref[i_h].astype(jnp.float32) * jnp.minimum(BT, eos - i_t * BT)).astype(g_gamma_ref.dtype)
+            scratch_ref[...] *= exp(b_g_last)
+            v_tile = (v_tile * exp(b_g_last - b_g)[:, None]).astype(v_tile.dtype)
+        
+        if gk_ref is not None:
+            gk_tile = gk_ref[(0, slice(None), slice(None))] # BT * BK
+            g_last = gk_tile[-1, :]
+            decay = exp(g_last)
+            scratch_ref[...] = scratch_ref[...] * decay[:, None]  # [BK, BV] * [BK,1]
+            k_tile = (k_tile * exp(g_last[None, :] - gk_tile)).astype(k_tile.dtype)
+
+        # state update
+        scratch_ref[...] = scratch_ref[...] + jax.lax.dot(
+                k_tile.astype(jnp.float32).T,
+                v_tile.astype(jnp.float32),
+                precision=lax.Precision.HIGHEST,
+                preferred_element_type=jnp.float32,
+        )
+
+        @pl.when(t0 + BT >= eos)
+        def write_final():
+            if ht_ref is not None:
+                ht_ref[seq_idx, 0] = scratch_ref[...].astype(jnp.float32)
+
+
+def check_chunk_fwd(x):
+    assert x is None, "x should be None."
+
+
+# note: The precision difference between this kernel on the TPU and FLA on the GPU is 5e-2.
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "output_final_state",
+        "chunk_size",
+        "split_size",
+        "states_in_fp32",
+        "interpret",
+    ],
+)
+def chunk_fwd_h_kernel_varlen(
+    k: jax.Array,  # [B,T,H,K]
+    v: jax.Array,  # [B,T,H,V]
+    g: jax.Array | None = None,  # [B,T,H]
+    g_gamma: jax.Array | None = None,  # (H,)
+    gk: jax.Array | None = None,  # [B,T,H,K]
+    gv: jax.Array | None = None,  # [B,T,H,V]
+    h0: jax.Array | None = None,  # [N,H,K,V]
+    output_final_state: bool = False,
+    cu_seqlens_dev: jax.Array | None = None,
+    chunk_size: int = 128,
+    split_size: int | None = None,
+    states_in_fp32: bool = False,
+    interpret: bool = False,
+):
+    check_chunk_fwd(g)
+    check_chunk_fwd(gv)
+    # todo: tune bk and bv for bast performance
+    BK = 128
+    BV = 128
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    assert K % 128 == 0, "K % 128 must equal to 0."
+    assert V % 128 == 0, "V % 128 must equal to 0."
+    assert T % chunk_size == 0, "T mod chunk_size must equal to 0."
+
+    BT = chunk_size
+    BS = BT if split_size is None else split_size
+    assert BS % BT == 0, (
+        f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
+    )
+    # N: the actual number of sequences in the batch with either equal or variable lengths
+
+    T_sum = B * T
+    chunk_to_seq = _build_chunk_map(cu_seqlens=cu_seqlens_dev, T_sum=T_sum, BT=BT)
+
+    N, NS = (
+        len(cu_seqlens_dev) - 1,
+        T_sum // BS,
+    )  # split_offsets[-1] # NS number of chunk_size
+
+    k = jnp.reshape(k, (T_sum, H, K))
+    v = jnp.reshape(v, (T_sum, H, V))
+
+    k = jnp.transpose(k, (1, 0, 2))  # (H,B*T,K)
+    v = jnp.transpose(v, (1, 0, 2))  # (H,B*T,V)
+    if gk is not None:
+        gk = jnp.reshape(gk, (T_sum, H, K))
+        gk = jnp.transpose(gk, (1, 0, 2))  # (H,B*T,K)
+
+    grid = (H, pl.cdiv(K, BK), pl.cdiv(V, BV), T_sum//BT)
+
+    def k_index_map(head_index, k_index, _, t_index):
+        return head_index, t_index, k_index
+
+    def gk_index_map(head_index, k_index, _, t_index):
+        return head_index, t_index, k_index
+
+    def v_index_map(head_index, _, v_index, t_index):
+        return head_index, t_index, v_index
+
+    def h0_index_map(head_index, k_index, v_index, t_index):
+        return 0, head_index, k_index, v_index
+
+    def ht_index_map(head_index, k_index, v_index, t_index):
+        return 0, head_index, k_index, v_index
+
+    def h_index_map(head_index, k_index, v_index, t_index):
+        return 0, head_index, k_index, v_index
+
+    out_shape = [
+        jax.ShapeDtypeStruct(
+            shape=(NS, H, K, V), dtype=k.dtype if not states_in_fp32 else jnp.float32
+        )
+    ]
+    out_specs = [pl.BlockSpec((NS, 1, BK, BV), h_index_map)]
+    if output_final_state:
+        out_shape.append(jax.ShapeDtypeStruct(shape=(N, H, K, V), dtype=jnp.float32))
+        out_specs.append(pl.BlockSpec((N, 1, BK, BV), ht_index_map))
+    else:
+        out_shape.append(None)
+        out_specs.append(None)
+
+    in_specs = [
+        pl.BlockSpec((1, BT, BK), k_index_map),
+        pl.BlockSpec((1, BT, BV), v_index_map),
+    ]
+    if h0 is not None:
+        in_specs.append(pl.BlockSpec((N, 1, BK, BV), h0_index_map))
+    else:
+        in_specs.append(None)
+    if gk is not None:
+        in_specs.append(pl.BlockSpec((1, BT, BK), gk_index_map))
+    else:
+        in_specs.append(None)
+    
+    if g_gamma is not None:
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    else:
+        in_specs.append(None)
+
+    in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    scratch = pltpu.VMEM((BK, BV), jnp.float32)
+    scratch_shapes = [scratch]
+    kernel = functools.partial(
+        _chunk_fwd_h_kernel_varlen,
+        BT=BT,
+        BS=BS,
+    )
+    h, ht = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes = scratch_shapes,
+        ),
+        out_shape=out_shape,
+        interpret=interpret,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=(
+                "parallel",
+                "parallel",
+                "parallel",
+                "arbitrary",
+            ),
+            vmem_limit_bytes=128 * 1024 * 1024,
+        ),
+    )(k, v, h0, gk, g_gamma, cu_seqlens_dev, chunk_to_seq)
+    if output_final_state:
+        return h, ht
+    return h, None
 
 __all__ = export_public(globals())

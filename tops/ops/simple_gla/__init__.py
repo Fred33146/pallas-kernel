@@ -6,7 +6,7 @@ from typing import Literal
 import jax
 
 from tops.utils import assert_shape, assert_shape_or_none
-from .chunk import chunk_simple_gla, chunk_simple_gla_bwd, chunk_simple_gla_fwd
+from .chunk import chunk_simple_gla, chunk_simple_gla_bwd, chunk_simple_gla_fwd, chunk_simple_gla_fwd_varlen
 from .fused_chunk import fused_chunk_simple_gla, fused_chunk_simple_gla_fwd, fused_chunk_simple_gla_bwd
 from .fused_recurrent import fused_recurrent_simple_gla
 from .naive import simple_gla_naive
@@ -180,10 +180,12 @@ def simple_gla_fwd(
     mode: SimpleGLAKernelMode = SimpleGLAKernelMode.FUSED_CHUNK
 ):
     fn = None
-    if mode == SimpleGLAKernelMode.CHUNK:
+    if mode == SimpleGLAKernelMode.CHUNK and cu_seqlens_dev is None:
         fn = chunk_simple_gla_fwd
-    elif mode == SimpleGLAKernelMode.FUSED_CHUNK:
+    elif mode == SimpleGLAKernelMode.FUSED_CHUNK and cu_seqlens_dev is None:
         fn = fused_chunk_simple_gla_fwd
+    elif cu_seqlens_dev is not None:
+        fn = chunk_simple_gla_fwd_varlen
     else:
         raise Exception(f"mode {mode} not support")
     return fn(

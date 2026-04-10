@@ -36,6 +36,7 @@ from tops.ops.gla import (
 from tops.ops.simple_gla import (
     chunk_simple_gla_bwd,
     chunk_simple_gla_fwd,
+    chunk_simple_gla_fwd_varlen,
     simple_gla_naive,
     fused_chunk_simple_gla_fwd,
     fused_chunk_simple_gla_bwd,
@@ -52,6 +53,7 @@ ALL_PROVIDERS = [
     "fused_chunk",
     "simple_gla_naive",
     "simple_gla_chunk",
+    "simple_gla_chunk_varlen",
     "fused_simple_gla_chunk",
     "fused_recurrent_bwd",
     "chunk_bwd",
@@ -190,6 +192,21 @@ def _run_provider(
         fn = partial(
             chunk_simple_gla_fwd, q, k, v,
             g_gamma=g_gamma, scale=scale, chunk_size=chunk_size,
+        )
+    elif provider == "simple_gla_chunk_varlen":
+        # chunk_simple_gla_fwd requires T % chunk_size == 0 and D % 128 == 0
+        chunk_size = 64
+        if T % chunk_size != 0 or D % 128 != 0:
+            return None
+        _b,_t,_h,_k,_v = q.shape[0],q.shape[1],q.shape[2],q.shape[3],v.shape[3]
+
+        q=jnp.reshape(q, (1, _b*_t, _h, _k))
+        k=jnp.reshape(k, (1, _b*_t, _h, _k))
+        v=jnp.reshape(v, (1, _b*_t, _h, _v))
+        cu_seqlens = jnp.arange(0, _b * _t + 1, _t)
+        fn = partial(
+            chunk_simple_gla_fwd_varlen, q, k, v,
+            g_gamma=g_gamma, scale=scale, chunk_size=chunk_size, cu_seqlens_dev=cu_seqlens,
         )
     elif provider == "fused_simple_gla_chunk":
         # chunk_simple_gla_fwd requires T % chunk_size == 0 and D % 128 == 0

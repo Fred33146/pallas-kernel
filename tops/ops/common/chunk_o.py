@@ -471,7 +471,6 @@ def chunk_fwd_o(
     assert_shape_or_none(g_gamma, (H,))
     assert T % C == 0, f"Sequence length T={T} must be divisible by chunk_size={C}"
     assert (cu_seqlens_cpu is None) or (cu_seqlens_cpu % chunk_size == 0).all(), "All sequence lengths must be divisible by chunk_size"
-    assert cu_seqlens_dev is None or (cu_seqlens_dev % chunk_size == 0).all(), "All device sequence lengths must be divisible by chunk_size"
     if cu_seqlens_cpu is not None or cu_seqlens_dev is not None:
         assert B == 1, f"Packed varlen chunk_fwd_o expects B=1, got B={B}"
     assert scale is not None

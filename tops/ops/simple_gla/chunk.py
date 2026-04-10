@@ -6,7 +6,7 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
 from tops.ops.common.chunk_h import chunk_fwd_h_kernel as chunk_fwd_h
-from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh
+from tops.ops.common.chunk_h import chunk_bwd_dh_kernel as chunk_bwd_dh, chunk_fwd_h_kernel_varlen as chunk_fwd_h_varlen
 from tops.ops.common.chunk_o import chunk_fwd_o, chunk_simple_gla_bwd_o_pl
 
 from tops.ops.gla.chunk import chunk_gla_fwd_intra_gk_ref
@@ -502,6 +502,63 @@ def chunk_simple_gla_fwd(
         output_final_state=use_ht,
         states_in_fp32=False,
         cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_dev=cu_seqlens_dev,
+        chunk_size=chunk_size,
+    )
+    o = chunk_fwd_o(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        g_gamma=g_gamma,
+        h=h,
+        scale=scale,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_dev=cu_seqlens_dev,
+        chunk_size=chunk_size,
+    )
+    return o, ht
+
+def chunk_simple_gla_fwd_varlen(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    *,
+    g: jax.Array | None = None,
+    g_gamma: jax.Array | None = None,
+    scale: float | None = None,
+    h0: jax.Array | None = None,
+    use_ht: bool = False,
+    cu_seqlens_cpu: jax.Array | None = None,
+    cu_seqlens_dev: jax.Array | None = None,
+    chunk_size: int = 64,
+    interpret: bool | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
+    B, T, H, K, V = *q.shape, v.shape[-1]
+    N = cu_seqlens_dev.shape[0] - 1 if cu_seqlens_dev is not None else B
+
+    assert_shape(q, (B, T, H, K))
+    assert_shape(k, (B, T, H, K))
+    assert_shape(v, (B, T, H, V))
+    assert_shape_or_none(g, (B, T, H))
+    assert_shape_or_none(g_gamma, (H,))
+    assert_shape_or_none(h0, (N, H, K, V))
+    assert T % chunk_size == 0
+    assert cu_seqlens_cpu is None, "cu_seqlens_cpu is None."
+    assert cu_seqlens_dev is not None, "cu_seqlens_dev is not None."
+    assert (K % 128 == 0) and (V % 128 == 0)
+    assert B == 1, "B must be 1."
+
+    h, ht = chunk_fwd_h_varlen(
+        k=k,
+        v=v,
+        g=g,
+        g_gamma=g_gamma,
+        gk=None,
+        gv=None,
+        h0=h0,
+        output_final_state=use_ht,
+        states_in_fp32=False,
         cu_seqlens_dev=cu_seqlens_dev,
         chunk_size=chunk_size,
     )
