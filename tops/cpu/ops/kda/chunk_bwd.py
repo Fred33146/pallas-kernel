@@ -346,3 +346,314 @@ def chunk_kda_bwd_wy_dqkg_fused(
     dA = _from_bh(dA_flat, BT)
 
     return dq, dk, dv2, db, dg, dA
+
+
+@cpu_reference
+def chunk_kda_bwd_dAv(
+    q: jax.Array,         # [B, T, H, K]
+    k: jax.Array,         # [B, T, H, K]
+    v: jax.Array,         # [B, T, H, V]
+    do: jax.Array,        # [B, T, H, V]
+    A: jax.Array,         # [B, T, H, BT]
+    scale: float,
+    chunk_size: int = DEFAULT_BT,
+) -> Tuple[jax.Array, jax.Array]:
+    """
+    Compute dA (attention gradient) and dv (value gradient) for the backward pass.
+
+    This kernel computes the first stage of the KDA backward pass, computing
+    the gradient of the attention matrix A and the value gradient dv from the
+    output gradient do.
+
+    Args:
+        q:     [B, T, H, K]   query tensor.
+        k:     [B, T, H, K]   key tensor.
+        v:     [B, T, H, V]   value tensor (v_new in the full backward).
+        do:    [B, T, H, V]   output gradient.
+        A:     [B, T, H, BT]  attention matrix (Aqk).
+        scale: float           softmax scaling factor.
+        chunk_size: int        chunk size (BT).
+
+    Returns:
+        dA: [B, T, H, BT]  attention gradient (float32).
+        dv: [B, T, H, V]   value gradient (same dtype as do).
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    NT = cdiv(T, BT)
+    BV = min(next_power_of_2(V), DEFAULT_BV)
+
+    # =================== input shape assertions ===================
+    assert_shape(q, (B, T, H, K), "q")
+    assert_shape(k, (B, T, H, K), "k")
+    assert_shape(v, (B, T, H, V), "v")
+    assert_shape(do, (B, T, H, V), "do")
+    assert_shape(A, (B, T, H, BT), "A")
+    assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
+    # ==============================================================
+
+    # Reshape to [B*H, T, D] for easier per-head processing
+    # The Triton kernel uses (bos*H + i_h)*D strides, equivalent to [B, T, H, D]
+    # We process each (batch, head) pair independently
+
+    def _per_batch_head(q_bh, k_bh, v_bh, do_bh, A_bh):
+        """Process one (batch, head) pair. Shapes: [T, D]."""
+        # Pad T to multiple of BT
+        T_actual = q_bh.shape[0]
+        T_padded = NT * BT
+
+        q_bh = pad_to_multiple(q_bh, T_padded, axis=0)
+        k_bh = pad_to_multiple(k_bh, T_padded, axis=0)
+        v_bh = pad_to_multiple(v_bh, T_padded, axis=0)
+        do_bh = pad_to_multiple(do_bh, T_padded, axis=0)
+        A_bh = pad_to_multiple(A_bh, T_padded, axis=0)
+
+        # Reshape into chunks: [NT, BT, D]
+        q_chunks = q_bh.reshape(NT, BT, K)
+        k_chunks = k_bh.reshape(NT, BT, K)
+        v_chunks = v_bh.reshape(NT, BT, V)
+        do_chunks = do_bh.reshape(NT, BT, V)
+        A_chunks = A_bh.reshape(NT, BT, BT)
+
+        # Process each chunk with vmap over the NT dimension
+        def process_chunk(q_c, k_c, v_c, A_c, do_c):
+            dv_c = jnp.zeros([BT, V], dtype=do.dtype)
+            dA_c = jnp.zeros([BT, BT], dtype=jnp.float32)
+
+            o_t = jnp.arange(BT)
+            # Causal mask for A: keep lower-tri + diagonal (i >= j)
+            # Triton loads A transposed, so its upper-tri mask on A^T = lower-tri on A
+            m_A = (o_t[:, None] >= o_t[None, :])
+            b_A = jnp.where(m_A, A_c, 0.0).astype(do_c.dtype)
+
+            # Loop over V blocks
+            def v_block_body(i_v, carry):
+                dA_acc, dv_acc = carry
+                v_start = i_v * BV
+                # Slice V block
+                b_v = lax.dynamic_slice(v_c, (0, v_start), (BT, BV))
+                b_do = lax.dynamic_slice(do_c, (0, v_start), (BT, BV))
+
+                # dA += do @ v^T
+                dA_acc = dA_acc + jnp.dot(b_do.astype(jnp.float32), b_v.astype(jnp.float32).T)
+
+                # dv = A^T @ do (Triton loads A transposed, so dot(A_T, do);
+                # here A is not transposed, so we use A.T)
+                b_dv = jnp.dot(b_A.T, b_do)
+                dv_acc = lax.dynamic_update_slice(dv_acc, b_dv, (0, v_start))
+                return dA_acc, dv_acc
+
+            num_vb = cdiv(V, BV)
+            dA_c, dv_c = lax.fori_loop(0, num_vb, v_block_body, (dA_c, dv_c))
+
+            # Apply causal mask and scale to dA
+            m_causal = (o_t[:, None] >= o_t[None, :])
+            dA_c = jnp.where(m_causal, dA_c * scale, 0.0)
+
+            return dA_c, dv_c
+
+        dA_chunks, dv_chunks = jax.vmap(process_chunk)(
+            q_chunks, k_chunks, v_chunks, A_chunks, do_chunks
+        )
+        # Reshape back: [NT, BT, ...] -> [T_padded, ...]
+        dA_out = dA_chunks.reshape(T_padded, BT)[:T_actual]
+        dv_out = dv_chunks.reshape(T_padded, V)[:T_actual]
+        return dA_out, dv_out
+
+    # vmap over batch and head: reshape [B, T, H, D] -> [B*H, T, D]
+    q_flat = q.transpose(0, 2, 1, 3).reshape(B * H, T, K)      # [B*H, T, K]
+    k_flat = k.transpose(0, 2, 1, 3).reshape(B * H, T, K)
+    v_flat = v.transpose(0, 2, 1, 3).reshape(B * H, T, V)
+    do_flat = do.transpose(0, 2, 1, 3).reshape(B * H, T, V)
+    A_flat = A.transpose(0, 2, 1, 3).reshape(B * H, T, BT)
+
+    dA_flat, dv_flat = jax.vmap(_per_batch_head)(q_flat, k_flat, v_flat, do_flat, A_flat)
+
+    # Reshape back to [B, T, H, ...]
+    dA = dA_flat.reshape(B, H, T, BT).transpose(0, 2, 1, 3)    # [B, T, H, BT]
+    dv = dv_flat.reshape(B, H, T, V).transpose(0, 2, 1, 3)     # [B, T, H, V]
+
+    return dA, dv
+
+
+@cpu_reference
+def chunk_gated_delta_rule_bwd_dhu(
+    q: jax.Array,                   # [B, T, H, K]  (gated query)
+    k: jax.Array,                   # [B, T, H, K]  (gated key)
+    w: jax.Array,                   # [B, T, H, K]  (delta-rule erase weight)
+    gk: jax.Array,                  # [B, T, H, K]  (per-key gate, cumsum'd, log2-space)
+    h0: Optional[jax.Array],        # [B, H, K, V] or None (initial state)
+    dht: Optional[jax.Array],       # [B, H, K, V] or None (gradient of final state)
+    do: jax.Array,                  # [B, T, H, V]  (gradient of output)
+    dv: jax.Array,                  # [B, T, H, V]  (gradient of v from dAv stage)
+    scale: float,
+    chunk_size: int = DEFAULT_BT,
+    use_exp2: bool = True,
+) -> Tuple[jax.Array, Optional[jax.Array], jax.Array]:
+    """Backward recurrence through chunks computing dh, dh0, dv2.
+
+    Mirrors chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64 from Triton.
+
+    Args:
+        q:    [B, T, H, K]   gated query tensor.
+        k:    [B, T, H, K]   gated key tensor.
+        w:    [B, T, H, K]   delta-rule erase weight.
+        gk:   [B, T, H, K]   per-key gate (cumsum'd, log2-space).
+        h0:   [B, H, K, V]   initial hidden state or None.
+        dht:  [B, H, K, V]   gradient of final state or None.
+        do:   [B, T, H, V]   output gradient.
+        dv:   [B, T, H, V]   value gradient from dAv stage.
+        scale: float          softmax scaling factor.
+        use_exp2: bool        use base-2 exponential (default True).
+
+    Returns:
+        dh:  [B, NT, H, K, V]  per-chunk hidden state gradient.
+        dh0: [B, H, K, V]     gradient of initial state or None.
+        dv2: [B, T, H, V]     updated value gradient.
+    """
+    B, T, H, K = q.shape
+    V = do.shape[-1]
+    BT = chunk_size
+    NT = cdiv(T, BT)
+
+    # =================== input shape assertions ===================
+    assert_shape(q, (B, T, H, K), "q")
+    assert_shape(k, (B, T, H, K), "k")
+    assert_shape(w, (B, T, H, K), "w")
+    assert_shape(gk, (B, T, H, K), "gk")
+    assert_shape(do, (B, T, H, V), "do")
+    assert_shape(dv, (B, T, H, V), "dv")
+    if h0 is not None:
+        assert_shape(h0, (B, H, K, V), "h0")
+    if dht is not None:
+        assert_shape(dht, (B, H, K, V), "dht")
+    assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
+    # ==============================================================
+
+    def _per_batch_head(q_bh, k_bh, w_bh, gk_bh, do_bh, dv_bh, dht_bh, h0_bh):
+        """Process one (batch, head). All shapes: q,k,w,gk=[T,K], do,dv=[T,V],
+        dht_bh=[K,V], h0_bh=[K,V]."""
+        T_actual = q_bh.shape[0]
+        T_padded = NT * BT
+
+        q_bh = pad_to_multiple(q_bh, T_padded, 0)
+        k_bh = pad_to_multiple(k_bh, T_padded, 0)
+        w_bh = pad_to_multiple(w_bh, T_padded, 0)
+        gk_bh = pad_to_multiple(gk_bh, T_padded, 0)
+        do_bh = pad_to_multiple(do_bh, T_padded, 0)
+        dv_bh = pad_to_multiple(dv_bh, T_padded, 0)
+
+        # Reshape into chunks [NT, BT, D]
+        q_c = q_bh.reshape(NT, BT, K)
+        k_c = k_bh.reshape(NT, BT, K)
+        w_c = w_bh.reshape(NT, BT, K)
+        gk_c = gk_bh.reshape(NT, BT, K)
+        do_c = do_bh.reshape(NT, BT, V)
+        dv_c = dv_bh.reshape(NT, BT, V)
+
+        # Reverse scan through chunks
+        def scan_fn(carry, t_rev):
+            b_dh = carry  # [K, V]
+            i_t = NT - 1 - t_rev
+
+            b_q = q_c[i_t]    # [BT, K]
+            b_k = k_c[i_t]    # [BT, K]
+            b_w = w_c[i_t]    # [BT, K]
+            b_gk = gk_c[i_t]  # [BT, K]
+            b_do = do_c[i_t]  # [BT, V]
+            b_dv = dv_c[i_t]  # [BT, V]
+
+            # Store current dh for this chunk
+            dh_out = b_dh  # [K, V]
+
+            # Last valid position gate value
+            last_idx = jnp.minimum((i_t + 1) * BT, T_actual) - 1
+            chunk_start = i_t * BT
+            local_last = last_idx - chunk_start  # local index within chunk
+
+            # gk at last position: [K]
+            b_gk_last = b_gk[local_last]
+
+            # Compute dv2: inter-chunk contribution
+            # dv2 = k @ dh + dv   (k is [BT,K], dh is [K,V] → [BT,V])
+            b_dv2 = jnp.dot(b_k.astype(jnp.float32), b_dh.astype(jnp.float32))  # [BT, V]
+
+            # Apply gating: dv2 *= exp2(gk_last - gk) per position per K-dim
+            # But dv2 is [BT,V] and gk_last/gk are [K]-dim. The gating was already baked
+            # into k (k is kg = k * exp2(gk_last - gk)), so we only need scalar gate.
+            # Actually in the Triton kernel, k is kg (gated key), and gk here is the
+            # cumsum gate. The kernel applies exp2(gk_last - gk) as a per-position scalar
+            # from the scalar gate g (not gk). But in KDA's case, there's no scalar g,
+            # only gk. Looking at the Triton code: USE_GK path applies
+            # exp2(gk_last[:]) to dh, not to dv2. The USE_G path (scalar gate) applies
+            # exp2(g_last - g[i]) to dv2. In KDA, the caller passes gk as gk, g is None.
+            # So USE_G=False, USE_GK=True.
+            # This means: no gating on dv2, only gk gating on dh.
+
+            b_dv2 = b_dv2 + b_dv  # [BT, V]
+
+            # Update dh: apply gk gating first
+            b_dh = b_dh * exp2(b_gk_last[:, None])  # [K, V] gated per K-dim
+
+            # Then accumulate: dh += q^T @ do * scale - w^T @ dv2
+            # q,w are loaded transposed in Triton: (K,T) with (1, H*K) strides
+            # So dot is q^T[K,BT] @ do[BT,V] = [K,V]
+            b_dh = b_dh + (
+                jnp.dot(b_q.astype(jnp.float32).T, b_do.astype(jnp.float32)) * scale
+                - jnp.dot(b_w.astype(jnp.float32).T, b_dv2.astype(jnp.float32))
+            )
+
+            return b_dh, (dh_out, b_dv2)
+
+        # Initialize from dht
+        init_dh = dht_bh.astype(jnp.float32) if dht_bh is not None else jnp.zeros((K, V), dtype=jnp.float32)
+
+        final_dh, (dh_all, dv2_all) = lax.scan(scan_fn, init_dh, jnp.arange(NT))
+        # dh_all is [NT, K, V] in reverse order (t_rev=0 → chunk NT-1)
+        # Reverse to get natural order
+        dh_all = dh_all[::-1]
+        dv2_all = dv2_all[::-1]
+
+        dv2_out = dv2_all.reshape(T_padded, V)[:T_actual]
+        dh0_out = final_dh  # [K, V] — gradient of initial state
+
+        return dh_all, dh0_out, dv2_out
+
+    # Reshape [B,T,H,D] → [B*H, T, D]
+    def _to_bh(x, d):
+        return x.transpose(0, 2, 1, 3).reshape(B * H, T, d)
+
+    q_flat = _to_bh(q, K)
+    k_flat = _to_bh(k, K)
+    w_flat = _to_bh(w, K)
+    gk_flat = _to_bh(gk, K)
+    do_flat = _to_bh(do, V)
+    dv_flat = _to_bh(dv, V)
+
+    # dht: [B, H, K, V] → [B*H, K, V]
+    if dht is not None:
+        dht_flat = dht.reshape(B * H, K, V)
+    else:
+        dht_flat = jnp.zeros((B * H, K, V), dtype=jnp.float32)
+
+    # h0: [B, H, K, V] → [B*H, K, V]
+    if h0 is not None:
+        h0_flat = h0.reshape(B * H, K, V)
+    else:
+        h0_flat = jnp.zeros((B * H, K, V), dtype=jnp.float32)
+
+    dh_flat, dh0_flat, dv2_flat = jax.vmap(_per_batch_head)(
+        q_flat, k_flat, w_flat, gk_flat, do_flat, dv_flat, dht_flat, h0_flat
+    )
+
+    # dh_flat: [B*H, NT, K, V] → [B, H, NT, K, V] → [B, NT, H, K, V]
+    dh = dh_flat.reshape(B, H, NT, K, V).transpose(0, 2, 1, 3, 4)
+
+    # dh0: [B*H, K, V] → [B, H, K, V]
+    dh0 = dh0_flat.reshape(B, H, K, V) if h0 is not None else None
+
+    # dv2: [B*H, T, V] → [B, H, T, V] → [B, T, H, V]
+    dv2 = dv2_flat.reshape(B, H, T, V).transpose(0, 2, 1, 3)
+
+    return dh, dh0, dv2

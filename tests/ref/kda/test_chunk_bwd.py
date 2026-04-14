@@ -16,13 +16,16 @@ HAS_CUDA = torch.cuda.is_available()
 
 HAS_FLA = False
 try:
+    from fla.ops.kda.chunk import chunk_kda_fwd as triton_chunk_kda_fwd
     from fla.ops.kda.chunk_bwd import (
-        chunk_kda_bwd as triton_chunk_kda_bwd,
         chunk_kda_bwd_dAv as triton_chunk_kda_bwd_dAv,
         chunk_kda_bwd_wy_dqkg_fused as triton_chunk_kda_bwd_wy_dqkg_fused,
     )
-    from fla.ops.kda.chunk_fwd import chunk_kda_fwd as triton_chunk_kda_fwd
-    from fla.utils import assert_close, device
+    from fla.ops.kda.wy_fast import recompute_w_u_fwd as triton_recompute_w_u_fwd
+    from fla.ops.common.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h as triton_chunk_gated_delta_rule_fwd_h,
+    )
+    from fla.utils import device
 
     HAS_FLA = True
 except ImportError:
@@ -56,26 +59,35 @@ def _generate_fwd_inputs(B, T, H, K, V=None, chunk_size=64,
     h0 = 0.01 * torch.randn(B, H, K, V, dtype=torch.float32, device=device)
     scale = K ** -0.5
 
-    # Run Triton forward with disable_recompute=True to keep all intermediates
-    (o, final_state, g_cumsum, Aqk, Akk,
-     w, u, qg, kg, v_new, h, initial_state) = triton_chunk_kda_fwd(
+    # Run Triton forward to get Aqk, Akk
+    o, Aqk, Akk, final_state = triton_chunk_kda_fwd(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
         initial_state=h0,
         output_final_state=True,
         chunk_size=chunk_size,
-        disable_recompute=True,
+    )
+
+    # Recompute intermediates (same as chunk_kda_bwd does internally)
+    w, u, qg, kg = triton_recompute_w_u_fwd(
+        q=q, k=k, v=v, beta=beta, A=Akk, gk=g,
+    )
+    h, v_new, _ = triton_chunk_gated_delta_rule_fwd_h(
+        k=kg, w=w, u=u, gk=g,
+        initial_state=h0,
+        output_final_state=False,
+        use_exp2=True,
     )
 
     do = input_scale * torch.randn_like(o)
     dht = 0.01 * torch.randn_like(h0)
 
     return dict(
-        q=q, k=k, v=v, g=g, g_cumsum=g_cumsum, beta=beta,
+        q=q, k=k, v=v, g=g, g_cumsum=g, beta=beta,
         h0=h0, scale=scale,
         Aqk=Aqk, Akk=Akk,
         w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h,
-        initial_state=initial_state,
+        initial_state=h0,
         o=o, final_state=final_state,
         do=do, dht=dht,
         chunk_size=chunk_size,
