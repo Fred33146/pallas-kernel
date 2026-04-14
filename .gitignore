@@ -30,3 +30,6 @@ Thumbs.db
 *.log
 .cluster_name_gpu
 .cluster_name_tpu
+
+# Claude
+.claude/

@@ -7,6 +7,8 @@ from .gate import (
   naive_kda_gate,
   naive_kda_lowerbound_gate,
 )
+
+from .chunk import chunk_kda_bwd_intra
 from .naive import naive_recurrent_kda, naive_chunk_kda
 
 __all__ = [
@@ -19,6 +21,7 @@ __all__ = [
   "kda_gate_bwd",
   "fused_kda_gate",
   "kda_gate_chunk_cumsum",
+  "chunk_kda_bwd_intra",
   "naive_recurrent_kda",
   "naive_chunk_kda",
 ]
