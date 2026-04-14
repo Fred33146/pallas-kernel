@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   gpu_tests:
+    if: github.event.pull_request.draft == false
     name: "GPU H100 tests vs Triton"
     runs-on: ubuntu-latest
     timeout-minutes: 60

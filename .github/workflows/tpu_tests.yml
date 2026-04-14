@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   tpu_tests:
+    if: github.event.pull_request.draft == false
     name: "TPU v7 tests"
     runs-on: ubuntu-latest
     permissions:
