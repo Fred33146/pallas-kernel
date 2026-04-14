@@ -8,6 +8,10 @@ _IS_TPU_RUNTIME_CACHED: bool | None = None
 def exp(x):
     return jnp.exp(x.astype(jnp.float32))
 
+def exp2(x):
+    """Base-2 exponential, matching Triton's tl.exp2."""
+    return jnp.exp2(x.astype(jnp.float32))
+
 def is_tpu_runtime() -> bool:
     """Return True if the current JAX runtime is on TPU devices.
 
