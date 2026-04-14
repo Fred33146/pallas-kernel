@@ -24,11 +24,13 @@ setup: |
 
 run: |
   set -ex
+  export TRITON_AUTOTUNE=0
   cd ~/pallas-kernel
   uv run python -m pytest \
     -o "addopts=--strict-markers" \
     tests/ref/kda/special/ \
-    -k triton \
+    --ignore=tests/ref/kda/special/test_chunk_bwd_dAv_dhu_pallas.py \
+    --ignore=tests/ref/kda/special/test_chunk_bwd_pallas.py \
     -v
   uv run python -m pytest \
     -o "addopts=--strict-markers" \

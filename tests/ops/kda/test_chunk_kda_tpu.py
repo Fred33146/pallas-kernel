@@ -159,8 +159,11 @@ class TestPallasIntraChunkBwd:
         q_pl, k_pl, g_pl, beta_pl, dAqk_pl, dAkk_pl = pallas_inputs
 
         # --- CPU ref (float32) ---
+        # CPU ref now uses exp2 (log2 gates) and same sign convention as Pallas,
+        # so pass log2 gates and same dAkk as Pallas.
+        g_cpu_log2 = g_cpu / jnp.log(2.0)
         dq_cpu, dk_cpu, db_cpu, dg_cpu = chunk_kda_bwd_intra(
-            q, k, g_cpu, beta, dAqk, dAkk_cpu, C, jnp.float32,
+            q, k, g_cpu_log2, beta, dAqk, -dAkk_cpu, chunk_size=C,
         )
 
         # --- Pallas TPU (bfloat16) ---

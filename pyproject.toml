@@ -72,6 +72,7 @@ addopts = [
   "--ignore=tests/ref",
   "--ignore=tests/layers/test_gla.py",
   "--ignore=tests/modules/test_modules.py",
+  "--ignore=tests/ops/kda/test_chunk_kda_tpu.py",
 ]
 
 [tool.ruff]

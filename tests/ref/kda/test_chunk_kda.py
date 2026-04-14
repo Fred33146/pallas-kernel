@@ -187,7 +187,7 @@ def test_standalone_matches_full_backward_fp64(cfg):
     dAqk, dAkk = _make_dA(B, H, NT, C, jnp.float64, seed=cfg["seed"] + 1)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk, C, acc_dt,
+        q, k, g, beta, dAqk, dAkk, chunk_size=C,
     )
 
     assert dq.shape == (B, T, H, K)
@@ -220,7 +220,7 @@ def test_standalone_symmetry_fp64(cfg):
     dAkk_zero = jnp.zeros((B, T, H, C), dtype=acc_dt)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk_zero, C, acc_dt,
+        q, k, g, beta, dAqk, dAkk_zero, chunk_size=C,
     )
     assert jnp.abs(dq).max() > 0, "dq should be nonzero with dAqk"
     assert jnp.allclose(db, 0.0, atol=1e-15), "db should be zero when dAkk=0"
@@ -230,7 +230,7 @@ def test_standalone_symmetry_fp64(cfg):
     _, dAkk = _make_dA(B, H, NT, C, jnp.float64, seed=cfg["seed"] + 2)
 
     dq2, dk2, db2, dg2 = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk_zero, dAkk, C, acc_dt,
+        q, k, g, beta, dAqk_zero, dAkk, chunk_size=C,
     )
     assert jnp.allclose(dq2, 0.0, atol=1e-15), "dq should be zero when dAqk=0"
     assert jnp.abs(db2).max() > 0, "db should be nonzero with dAkk"
@@ -252,7 +252,7 @@ def test_zero_gates_fp64():
     dAqk, dAkk = _make_dA(B, H, NT, C, jnp.float64, seed=78)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g_zero, beta, dAqk, dAkk, C, acc_dt,
+        q, k, g_zero, beta, dAqk, dAkk, chunk_size=C,
     )
 
     assert dq.shape == (B, T, H, K)
@@ -277,7 +277,7 @@ def test_beta_zero_fp64():
     _, dAkk = _make_dA(B, H, NT, C, jnp.float64, seed=56)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g, beta_zero, dAqk_zero, dAkk, C, acc_dt,
+        q, k, g, beta_zero, dAqk_zero, dAkk, chunk_size=C,
     )
 
     # dq should be zero (only dAqk path contributes to dq, and dAqk=0)
@@ -300,7 +300,7 @@ def test_beta_one_fp64():
     dAqk, dAkk = _make_dA(B, H, NT, C, jnp.float64, seed=67)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g, beta_one, dAqk, dAkk, C, acc_dt,
+        q, k, g, beta_one, dAqk, dAkk, chunk_size=C,
     )
 
     assert jnp.abs(dq).max() > 0
@@ -322,7 +322,7 @@ def test_chunk_size_one_fp64():
     assert jnp.allclose(dAkk, 0.0)
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk, C, acc_dt,
+        q, k, g, beta, dAqk, dAkk, chunk_size=C,
     )
 
     assert dq.shape == (B, T, H, K)
@@ -347,10 +347,10 @@ def test_linearity_dAqk_fp64():
     dAkk_zero = jnp.zeros((B, T, H, C), dtype=acc_dt)
 
     dq1, dk1, db1, dg1 = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk_zero, C, acc_dt,
+        q, k, g, beta, dAqk, dAkk_zero, chunk_size=C,
     )
     dq2, dk2, db2, dg2 = chunk_kda_bwd_intra(
-        q, k, g, beta, alpha * dAqk, dAkk_zero, C, acc_dt,
+        q, k, g, beta, alpha * dAqk, dAkk_zero, chunk_size=C,
     )
 
     np.testing.assert_allclose(
@@ -379,10 +379,10 @@ def test_linearity_dAkk_fp64():
     dAqk_zero = jnp.zeros((B, T, H, C), dtype=acc_dt)
 
     dq1, dk1, db1, dg1 = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk_zero, dAkk, C, acc_dt,
+        q, k, g, beta, dAqk_zero, dAkk, chunk_size=C,
     )
     dq2, dk2, db2, dg2 = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk_zero, alpha * dAkk, C, acc_dt,
+        q, k, g, beta, dAqk_zero, alpha * dAkk, chunk_size=C,
     )
 
     np.testing.assert_allclose(
@@ -422,30 +422,18 @@ def test_cpu_ref_vs_triton_bwd_intra(cfg):
 
     # ---- JAX CPU ref ----
     dq_jax, dk_jax, db_jax, dg_jax = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk, C, dtype,
+        q, k, g, beta, dAqk, dAkk, chunk_size=C,
     )
-
-    # FLA's Triton kernel applies the reverse cumsum to dg internally,
-    # while JAX's standalone bwd_intra outputs dL/dg_cumsum (before rcum).
-    dg_jax_rc = dg_jax.reshape(B, NT, C, H, K)
-    dg_jax_rc = jnp.cumsum(dg_jax_rc[:, :, ::-1, :, :], axis=2)[:, :, ::-1, :, :]
-    dg_jax = dg_jax_rc.reshape(B, T, H, K)
-
-    # FLA Triton uses exp2; convert gates from natural log to log2
-    g_log2 = np.asarray(g / jnp.log(2.0))
-    # FLA expects dAkk already negated (from Stage 2); JAX ref applies
-    # its own negation (-beta) internally, so negate here to match.
-    dAkk_neg = np.asarray(-dAkk)
 
     def _to_torch(x, dtype=torch.float32):
         return torch.tensor(np.asarray(x), dtype=dtype, device="cuda")
 
     q_t = _to_torch(q)
     k_t = _to_torch(k)
-    g_t = _to_torch(g_log2)
+    g_t = _to_torch(g)
     beta_t = _to_torch(beta)
     dAqk_t = _to_torch(dAqk)
-    dAkk_t = _to_torch(dAkk_neg)
+    dAkk_t = _to_torch(dAkk)
 
     dq_t = torch.zeros_like(q_t)
     dk_t = torch.zeros_like(k_t)
@@ -514,24 +502,17 @@ def test_cpu_ref_vs_triton_special_inputs(label, beta_override, g_override):
 
     # ---- JAX CPU ref ----
     dq_jax, dk_jax, db_jax, dg_jax = chunk_kda_bwd_intra(
-        q, k, g, beta, dAqk, dAkk, C, dtype,
+        q, k, g, beta, dAqk, dAkk, chunk_size=C,
     )
-    dg_jax_rc = dg_jax.reshape(B, NT, C, H, K)
-    dg_jax_rc = jnp.cumsum(dg_jax_rc[:, :, ::-1, :, :], axis=2)[:, :, ::-1, :, :]
-    dg_jax = dg_jax_rc.reshape(B, T, H, K)
-
-    g_log2 = np.asarray(g / jnp.log(2.0))
-    dAkk_neg = np.asarray(-dAkk)
-
     def _to_torch(x, dtype=torch.float32):
         return torch.tensor(np.asarray(x), dtype=dtype, device="cuda")
 
     q_t = _to_torch(q)
     k_t = _to_torch(k)
-    g_t = _to_torch(g_log2)
+    g_t = _to_torch(g)
     beta_t = _to_torch(beta)
     dAqk_t = _to_torch(dAqk)
-    dAkk_t = _to_torch(dAkk_neg)
+    dAkk_t = _to_torch(dAkk)
 
     dq_t = torch.zeros_like(q_t)
     dk_t = torch.zeros_like(k_t)

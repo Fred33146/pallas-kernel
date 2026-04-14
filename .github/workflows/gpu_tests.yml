@@ -48,7 +48,6 @@ jobs:
           sky launch .github/ci/gpu-tests.sky.yaml \
             --cluster "${{ steps.cluster.outputs.name }}" \
             --env BRANCH="${{ github.head_ref || github.ref_name }}" \
-            --idle-minutes-to-autostop 5 \
             -y
 
       - name: Cleanup
