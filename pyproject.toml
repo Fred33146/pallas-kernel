@@ -23,7 +23,7 @@ dev = [
 gpu = [
     "torch",
     "jax[cuda12]>=0.6.2",
-    "flash-linear-attention>=0.4.1",
+    "flash-linear-attention>=0.4.2",
 ]
 tpu = [
     "jax[tpu]>=0.8.1",

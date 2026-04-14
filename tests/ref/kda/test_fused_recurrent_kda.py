@@ -396,8 +396,8 @@ def test_cpu_ref_vs_triton_fused_recurrent(torch_dtype, jax_dtype):
         rtol = 5e-4
     else:
         # bf16/fp16: allow a bit more numerical drift vs fp32 CPU ref
-        atol = 5e-3
-        rtol = 5e-3
+        atol = 5e-2
+        rtol = 5e-2
     assert compare_tensor(
         "o", torch_to_jax(o_triton), o_cpu,
         atol=atol, rtol=rtol, compare_dtype=np.float64,

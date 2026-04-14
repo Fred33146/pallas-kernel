@@ -27,6 +27,11 @@ run: |
   cd ~/pallas-kernel
   uv run python -m pytest \
     -o "addopts=--strict-markers" \
+    tests/ref/kda/special/ \
+    -k triton \
+    -v
+  uv run python -m pytest \
+    -o "addopts=--strict-markers" \
     tests/ref/simple_gla/ \
     -k triton \
     -v
