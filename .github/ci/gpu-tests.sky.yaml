@@ -24,7 +24,6 @@ setup: |
 
 run: |
   set -ex
-  export TRITON_AUTOTUNE=0
   cd ~/pallas-kernel
   uv run python -m pytest \
     -o "addopts=--strict-markers" \
