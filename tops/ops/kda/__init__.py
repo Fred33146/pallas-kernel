@@ -10,12 +10,10 @@ Exports:
 from .chunk import chunk_kda, chunk_kda_fwd
 from .fused_recurrent import fused_recurrent_kda
 from .chunk_intra import chunk_kda_bwd_intra
-from .naive import naive_kda
 
 __all__ = [
     "chunk_kda",
     "chunk_kda_fwd",
     "fused_recurrent_kda",
-    "naive_kda",
     "chunk_kda_bwd_intra",
 ]

@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import jax
 
-from tops.ops.utils import exp2
+from tops.ops.utils import exp2, exp
 from tops.utils import assert_shape
 from jax.experimental import pallas as pl
 from functools import partial
@@ -457,7 +457,7 @@ def chunk_kda_bwd_dAv_kernel(
 def _chunk_gated_delta_rule_bwd_dhu_kernel(
     q_ref, k_ref, w_ref, gk_ref, do_ref, dv_ref, dht_ref,
     dh_ref, dh0_ref, dv2_ref,
-    *, scale, BT, K, V, NT,
+    *, scale, BT, K, V, NT, USE_EXP2,
 ):
     """Pallas kernel body for dhu — processes one (batch*head) tile.
 
@@ -477,6 +477,8 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
     b_dh = bdht.astype(jnp.float32)  # [K, V]
     dh_list = []
     dv2_list = []
+
+    _exp = exp2 if USE_EXP2 else exp
 
     for t_rev in range(NT):
         i_t = NT - 1 - t_rev
@@ -500,7 +502,7 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
         dv2_list.append(b_dv2)
 
         # Update dh: apply gk gating
-        b_dh = b_dh * exp2(b_gk_last[:, None])  # [K, V]
+        b_dh = b_dh * _exp(b_gk_last[:, None])  # [K, V]
 
         # Accumulate: dh += q^T @ do * scale - w^T @ dv2
         b_dh = b_dh + (
@@ -617,7 +619,7 @@ def chunk_gated_delta_rule_bwd_dhu_kernel(
     ]
 
     kernel = partial(_chunk_gated_delta_rule_bwd_dhu_kernel,
-                      scale=scale, BT=BT, K=K, V=V, NT=NT)
+                      scale=scale, BT=BT, K=K, V=V, NT=NT, USE_EXP2=use_exp2)
 
     interpret = not is_tpu_runtime()
 

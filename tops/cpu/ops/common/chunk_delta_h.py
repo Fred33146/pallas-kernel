@@ -14,8 +14,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from tops.ops.utils import exp2, exp
 from tops.cpu.ops.common.utils import acc_dtype, cdiv, dot, pad_to_multiple
-from tops.ops.utils import exp2
 from tops.utils import assert_shape
 
 
@@ -57,6 +57,7 @@ def chunk_gated_delta_rule_fwd_h(
       final_state: [B, H, K, V] or None
   """
   del g, cu_seqlens, transpose_state_layout  # not used in v1
+  _exp = exp2 if use_exp2 else exp
 
   B, T, H, K = k.shape
   V = u.shape[-1]
@@ -96,7 +97,7 @@ def chunk_gated_delta_rule_fwd_h(
     if gk is not None:
       b_gk = gk_c[:, i]  # [B, C, H, K]
       gk_last = b_gk[:, -1]  # [B, H, K]
-      h = h * jnp.exp2(gk_last[:, :, :, None])
+      h = h * _exp(gk_last[:, :, :, None])
 
     # Accumulate: h += k^T @ v_corrected
     h = h + dot("bchk,bchv->bhkv", b_k, v_corr, acc)
@@ -126,6 +127,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     cu_seqlens: jax.Array | None = None,
     chunk_size: int = 64,
     chunk_indices: jax.Array | None = None,
+    use_exp2: bool = False,
     transpose_state_layout: bool = False,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array]:
   """Backward recurrence through chunks computing dh, dh0, dv2.
@@ -150,6 +152,7 @@ def chunk_gated_delta_rule_bwd_dhu(
       dv2: [B, T, H, V]     updated value gradient.
   """
   del cu_seqlens, chunk_indices, transpose_state_layout  # not used in v1
+  _exp = exp2 if use_exp2 else exp
   B, T, H, K = q.shape
   V = do.shape[-1]
   BT = chunk_size
@@ -233,7 +236,7 @@ def chunk_gated_delta_rule_bwd_dhu(
           b_dv2 = b_dv2 + b_dv  # [BT, V]
 
           # Update dh: apply gk gating first
-          b_dh = b_dh * exp2(b_gk_last[:, None])  # [K, V] gated per K-dim
+          b_dh = b_dh * _exp(b_gk_last[:, None])  # [K, V] gated per K-dim
 
           # Then accumulate: dh += q^T @ do * scale - w^T @ dv2
           # q,w are loaded transposed in Triton: (K,T) with (1, H*K) strides

@@ -642,6 +642,7 @@ def chunk_kda_bwd(
   dh, dh0, dv_stage2 = chunk_gated_delta_rule_bwd_dhu(
     qg, kg, w, do, dv_init,
     gk=g, h0=initial_state, dht=dht, scale=scale, chunk_size=chunk_size,
+    use_exp2=True,
   )
 
   # ---- Stage 3: Fused WY backward ----
