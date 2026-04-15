@@ -8,13 +8,9 @@
 #   sky launch .github/ci/gpu-tests.sky.yaml --env BRANCH=main -y
 
 resources:
-  any_of:
-    - accelerators: H100:1
-      cloud: kubernetes
-      use_spot: true
-    - accelerators: H100:1
-      cloud: gcp
-      use_spot: true
+  accelerators: H100:1
+  cloud: gcp
+  use_spot: true
 
 setup: |
   set -ex
