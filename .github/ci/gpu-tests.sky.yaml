@@ -25,6 +25,7 @@ setup: |
 run: |
   set -ex
   cd ~/pallas-kernel
+  export TRITON_CACHE_DIR=/models/triton_compile_cache
   uv run python -m pytest \
     -o "addopts=--strict-markers" \
     tests/ref/kda/special/ \
