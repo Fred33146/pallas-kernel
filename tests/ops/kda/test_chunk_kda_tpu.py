@@ -18,7 +18,7 @@ from tops.cpu.ops.kda import chunk_kda_bwd_intra
 from tests.utils import compare_tensor
 
 try:
-    from tops.ops.kda import kda_intra_chunk_bwd
+    from tops.ops.kda import chunk_kda_bwd_intra as pallas_chunk_kda_bwd_intra
 
     HAS_PALLAS = True
 except ImportError:
@@ -167,15 +167,13 @@ class TestPallasIntraChunkBwd:
         )
 
         # --- Pallas TPU (bfloat16) ---
-        dq_pl, dk_pl, dg_pl, db_pl = kda_intra_chunk_bwd(
+        dq_pl, dk_pl, db_pl, dg_pl = pallas_chunk_kda_bwd_intra(
             q=q_pl,
             k=k_pl,
             g=g_pl,
             beta=beta_pl,
-            segment_ids=None,
             dAqk=dAqk_pl,
             dAkk=dAkk_pl,
-            scale=1.0,
             chunk_size=C,
         )
 

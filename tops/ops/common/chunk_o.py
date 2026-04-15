@@ -17,6 +17,104 @@ import jax.experimental.pallas.tpu as pltpu
 
 from tops.ops.utils import exp, get_interpret
 from tops.utils import assert_shape, assert_shape_or_none
+from tops.cpu.ops.common.utils import acc_dtype, cdiv, pad_to_multiple
+
+def chunk_local_cumsum(
+  g: jax.Array,
+  chunk_size: int,
+  reverse: bool = False,
+  cu_seqlens: jax.Array | None = None,
+  chunk_indices: jax.Array | None = None,
+) -> jax.Array:
+  """Chunk-local cumulative sum of gates.
+
+  Works for both 3D [B,T,H] (Simple GLA scalar gates) and 4D [B,T,H,K]
+  (GLA per-element gates). Cumsum is along the chunk dimension (axis 2
+  after reshaping to [B, NT, C, ...]).
+
+  When cu_seqlens is provided, the cumsum is applied independently per
+  segment so that it does not bleed across segment boundaries.
+  Two layouts are supported:
+    - Packed layout: g.shape[0] == 1, g is [1, T, H, ...] — iterates per
+      segment using cu_seqlens boundaries, pads each segment to chunk_size
+      multiples internally.
+    - Chunked layout: g.shape[0] > 1, g is [total_NT, C, ...] — each chunk
+      is independent (legacy path for GLA gather+flatten).
+
+  Args:
+      g: [B, T, H] or [B, T, H, K] or [total_NT, C, ...] — log-space gates
+      chunk_size: block size
+      reverse: if True, flip chunk axis before cumsum and flip back after
+      cu_seqlens: [N+1] cumulative sequence lengths defining segment
+          boundaries. If provided, cumsum is applied independently per
+          segment.
+
+  Returns:
+      g_cumsum: same shape as g, in fp32 (or fp64 for fp64 input)
+  """
+  if cu_seqlens is not None:
+    acc = acc_dtype(g.dtype)
+
+    if g.shape[0] == 1:
+      # Packed layout: [1, T, H, ...] — iterate per segment
+      N = len(cu_seqlens) - 1
+      C = chunk_size
+      result = jnp.zeros_like(g, dtype=acc)
+      for i_n in range(N):
+        bos = int(cu_seqlens[i_n])
+        eos = int(cu_seqlens[i_n + 1])
+        T_seg = eos - bos
+        if T_seg == 0:
+          continue
+        NT_seg = cdiv(T_seg, C)
+
+        seg_g = g[0, bos:eos].astype(acc)                    # [T_seg, ...]
+        # Pad to multiple of C
+        T_padded = NT_seg * C
+        if T_padded > T_seg:
+          seg_g = pad_to_multiple(seg_g, C, axis=0)
+        # Reshape to chunks: [NT_seg, C, ...]
+        shape = [NT_seg, C] + list(seg_g.shape[1:])
+        seg_g = seg_g.reshape(shape)
+        if reverse:
+          seg_g = jnp.flip(seg_g, axis=1)
+        seg_g = seg_g.cumsum(axis=1)
+        if reverse:
+          seg_g = jnp.flip(seg_g, axis=1)
+        # Flatten and trim to T_seg
+        flat = seg_g.reshape(-1, *g.shape[2:])[:T_seg]
+        result = result.at[0, bos:eos].set(flat)
+      return result
+    else:
+      # Chunked layout: [total_NT, C, ...] — each chunk independent (GLA path)
+      g_cast = g.astype(acc)
+      if reverse:
+        g_cast = jnp.flip(g_cast, axis=1)
+      g_cumsum = g_cast.cumsum(axis=1)
+      if reverse:
+        g_cumsum = jnp.flip(g_cumsum, axis=1)
+      return g_cumsum
+
+  C = chunk_size
+  T = g.shape[1]
+  assert T % C == 0, f"T ({T}) must be a multiple of chunk_size ({C})"
+  NT = T // C
+  acc = acc_dtype(g.dtype)
+  g_cast = g.astype(acc)
+
+  # Reshape: insert chunk dimension at axis 2
+  # 3D [B,T,H] -> [B,NT,C,H]; 4D [B,T,H,K] -> [B,NT,C,H,K]
+  shape = list(g_cast.shape)
+  shape[1:2] = [NT, C]
+  g_reshaped = g_cast.reshape(shape)
+
+  if reverse:
+    g_reshaped = jnp.flip(g_reshaped, axis=2)
+  g_cumsum = g_reshaped.cumsum(axis=2)
+  if reverse:
+    g_cumsum = jnp.flip(g_cumsum, axis=2)
+
+  return g_cumsum.reshape(g.shape).astype(acc)
 
 def _chunk_fwd_o_kernel(
     q_ref,

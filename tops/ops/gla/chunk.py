@@ -1313,9 +1313,10 @@ def chunk_gla_fwd_o_gk_pl_kernel(
         b_qg = (b_q * jnp.exp2(b_g_f32 - g_mid)).astype(b_q.dtype)
     else:
         b_qg = (b_q * jnp.exp(b_g_f32 - g_mid)).astype(b_q.dtype)
+    _exp_fn = jnp.exp2 if USE_EXP2 else jnp.exp
     b_o = jnp.dot(
         b_qg,
-        (b_h * jnp.exp(g_mid[0, :])[:, None]).astype(b_qg.dtype),
+        (b_h * _exp_fn(g_mid[0, :])[:, None]).astype(b_qg.dtype),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )

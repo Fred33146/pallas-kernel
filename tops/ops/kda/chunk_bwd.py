@@ -8,6 +8,13 @@ from functools import partial
 
 from tops.ops.utils import is_tpu_runtime
 from tops.utils import assert_shape_or_none
+from tops.cpu.ops.kda.wy_fast import recompute_w_u_fwd
+from tops.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from tops.ops.kda.chunk_intra import chunk_kda_bwd_intra
+from tops.ops.kda.gate import kda_gate_chunk_cumsum, kda_gate_bwd
+from tops.ops.common.chunk_o import chunk_local_cumsum
+
+RCP_LN2 = 1.4426950408889634
 
 def _chunk_kda_bwd_wy_dqkg_fused_kernel(
     # --- 11 inputs ---
@@ -19,7 +26,7 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
 ):
     """Pallas kernel body — processes one (chunk, batch*head) tile.
 
-    K and V are tiled into BK and BV blocks via jax.lax.fori_loop.
+    K and V are tiled into BK and BV blocks via unrolled Python loops.
     """
     # Each Ref has a leading singleton dim from the BlockSpec: [1, ...]
     bq   = q_ref[0]       # [BT, K]
@@ -27,7 +34,7 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
     bv   = v_ref[0]       # [BT, V]
     bvn  = vn_ref[0]      # [BT, V]
     bg   = g_ref[0]       # [BT, K]
-    bb   = beta_ref[0]    # [BT]
+    bb   = beta_ref[0][:, 0]  # [BT, 1] -> [BT]
     bA   = A_ref[0].T     # [BT, BT] — transposed (matching Triton load)
     bh   = h_ref[0]       # [K, V]
     bdh  = dh_ref[0]      # [K, V]
@@ -38,63 +45,53 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
     m_last  = (o_t == BT - 1).astype(jnp.float32)
     m_lower = o_t[:, None] > o_t[None, :]
 
-    # --- Helper: slice along last dim ---
-    def _sl2d_t(x, start, size):
-        """x[..., start:start+size] for 2D [BT, D]."""
-        return jax.lax.dynamic_slice(x, (0, start), (BT, size))
+    # Initialize accumulators
+    b_dA_acc  = jnp.zeros((BT, BT), jnp.float32)
+    b_db_acc  = jnp.zeros((BT,), jnp.float32)
 
-    def _sl2d_kv(x, rs, cs, rsize, csize):
-        """x[rs:rs+rsize, cs:cs+csize] for 2D [K, V]."""
-        return jax.lax.dynamic_slice(x, (rs, cs), (rsize, csize))
+    # Collect per-block results for concatenation (avoid .at which captures constants)
+    dq_blocks = []
+    dk_blocks = []
+    dg_blocks = []
+    dv2_blocks = []
 
-    # --- Inner V loop body (for fixed i_k) ---
-    def v_loop_body(i_v, carry):
-        b_dq_k, b_dk_k, b_dw_k, b_dgk, b_dA_acc, b_dv2, b_db_acc, i_k = carry
-        vs = i_v * BV
-
-        bvn_blk = _sl2d_t(bvn, vs, BV)     # [BT, BV]
-        bdo_blk = _sl2d_t(bdo, vs, BV)     # [BT, BV]
-        bdv_blk = _sl2d_t(bdv, vs, BV)     # [BT, BV]
-        bh_blk  = _sl2d_kv(bh, i_k * BK, vs, BK, BV)   # [BK, BV]
-        bdh_blk = _sl2d_kv(bdh, i_k * BK, vs, BK, BV)  # [BK, BV]
-
-        b_dgk  = b_dgk + (bh_blk * bdh_blk).sum(axis=1)
-        b_dq_k = b_dq_k + bdo_blk @ bh_blk.T
-        b_dk_k = b_dk_k + bvn_blk @ bdh_blk.T
-        b_dw_k = b_dw_k + bdv_blk @ bh_blk.T
-
-        # i_k == 0 branch
-        bv_blk = _sl2d_t(bv, vs, BV)                    # [BT, BV]
-        new_dA = b_dA_acc + bdv_blk @ bv_blk.T
-        b_dvb  = bA @ bdv_blk                            # [BT, BV]
-        new_dv2 = jax.lax.dynamic_update_slice(
-            b_dv2, b_dvb * bb[:, None], (0, vs))
-        new_db = b_db_acc + (b_dvb * bv_blk).sum(axis=1)
-        # Only apply the i_k==0 updates when i_k is actually 0
-        b_dA_acc = jnp.where(i_k == 0, new_dA, b_dA_acc)
-        b_dv2    = jnp.where(i_k == 0, new_dv2, b_dv2)
-        b_db_acc = jnp.where(i_k == 0, new_db, b_db_acc)
-
-        return (b_dq_k, b_dk_k, b_dw_k, b_dgk, b_dA_acc, b_dv2, b_db_acc, i_k)
-
-    # --- Outer K loop body ---
-    def k_loop_body(i_k, carry):
-        b_dA_acc, b_db_acc, b_dv2, b_dq_full, b_dk_full, b_dg_full = carry
+    # Unrolled K loop (NK is a static constant)
+    for i_k in range(NK):
         ks = i_k * BK
+        ke = ks + BK
 
-        bk_blk = _sl2d_t(bk, ks, BK)       # [BT, BK]
-        bg_blk = _sl2d_t(bg, ks, BK)        # [BT, BK]
-        bgn    = bg_blk[-1, :]               # [BK]
+        bk_blk = bk[:, ks:ke]       # [BT, BK]
+        bg_blk = bg[:, ks:ke]        # [BT, BK]
+        bgn    = bg_blk[-1, :]       # [BK]
 
         b_dq_k = jnp.zeros((BT, BK), jnp.float32)
         b_dk_k = jnp.zeros((BT, BK), jnp.float32)
         b_dw_k = jnp.zeros((BT, BK), jnp.float32)
         b_dgk  = jnp.zeros((BK,), jnp.float32)
 
-        # V loop
-        init_v = (b_dq_k, b_dk_k, b_dw_k, b_dgk, b_dA_acc, b_dv2, b_db_acc, i_k)
-        b_dq_k, b_dk_k, b_dw_k, b_dgk, b_dA_acc, b_dv2, b_db_acc, _ = \
-            jax.lax.fori_loop(0, NV, v_loop_body, init_v)
+        # Unrolled V loop (NV is a static constant)
+        for i_v in range(NV):
+            vs = i_v * BV
+            ve = vs + BV
+
+            bvn_blk = bvn[:, vs:ve]     # [BT, BV]
+            bdo_blk = bdo[:, vs:ve]     # [BT, BV]
+            bdv_blk = bdv[:, vs:ve]     # [BT, BV]
+            bh_blk  = bh[ks:ke, vs:ve]  # [BK, BV]
+            bdh_blk = bdh[ks:ke, vs:ve] # [BK, BV]
+
+            b_dgk  = b_dgk + (bh_blk * bdh_blk).sum(axis=1)
+            b_dq_k = b_dq_k + bdo_blk @ bh_blk.T
+            b_dk_k = b_dk_k + bvn_blk @ bdh_blk.T
+            b_dw_k = b_dw_k + bdv_blk @ bh_blk.T
+
+            # Only compute dA, dv2, db contributions on i_k == 0
+            if i_k == 0:
+                bv_blk = bv[:, vs:ve]                                # [BT, BV]
+                b_dA_acc = b_dA_acc + bdv_blk @ bv_blk.T
+                b_dvb  = bA @ bdv_blk                                # [BT, BV]
+                dv2_blocks.append(b_dvb * bb[:, None])
+                b_db_acc = b_db_acc + (b_dvb * bv_blk).sum(axis=1)
 
         # Gate application for this K block
         gk_exp = exp2(bg_blk)
@@ -110,7 +107,7 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
         dkgb = bA @ b_dw_k
         b_db_acc = b_db_acc + (dkgb * kg).sum(axis=1)
 
-        bq_blk = _sl2d_t(bq, ks, BK)
+        bq_blk = bq[:, ks:ke]
         kdk    = bk_blk * b_dk_k
         b_dgk  = b_dgk + kdk.sum(axis=0)
 
@@ -119,23 +116,15 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
                   + kg * dkgb * bb[:, None])
         b_dk_k = b_dk_k + dkgb * gb
 
-        b_dq_full = jax.lax.dynamic_update_slice(b_dq_full, b_dq_k, (0, ks))
-        b_dk_full = jax.lax.dynamic_update_slice(b_dk_full, b_dk_k, (0, ks))
-        b_dg_full = jax.lax.dynamic_update_slice(b_dg_full, b_dg_k, (0, ks))
+        dq_blocks.append(b_dq_k)
+        dk_blocks.append(b_dk_k)
+        dg_blocks.append(b_dg_k)
 
-        return (b_dA_acc, b_db_acc, b_dv2, b_dq_full, b_dk_full, b_dg_full)
-
-    # Initialize accumulators
-    b_dA_acc  = jnp.zeros((BT, BT), jnp.float32)
-    b_db_acc  = jnp.zeros((BT,), jnp.float32)
-    b_dv2     = jnp.zeros((BT, V), jnp.float32)
-    b_dq_full = jnp.zeros((BT, K), jnp.float32)
-    b_dk_full = jnp.zeros((BT, K), jnp.float32)
-    b_dg_full = jnp.zeros((BT, K), jnp.float32)
-
-    init_k = (b_dA_acc, b_db_acc, b_dv2, b_dq_full, b_dk_full, b_dg_full)
-    b_dA_acc, b_db_acc, b_dv2, b_dq_full, b_dk_full, b_dg_full = \
-        jax.lax.fori_loop(0, NK, k_loop_body, init_k)
+    # Assemble full-K outputs via concatenation
+    b_dq_full = jnp.concatenate(dq_blocks, axis=1) if len(dq_blocks) > 1 else dq_blocks[0]
+    b_dk_full = jnp.concatenate(dk_blocks, axis=1) if len(dk_blocks) > 1 else dk_blocks[0]
+    b_dg_full = jnp.concatenate(dg_blocks, axis=1) if len(dg_blocks) > 1 else dg_blocks[0]
+    b_dv2     = jnp.concatenate(dv2_blocks, axis=1) if len(dv2_blocks) > 1 else dv2_blocks[0]
 
     # Post-process dA
     b_dA_acc = jnp.where(m_lower, b_dA_acc * bb[None, :], 0.0)
@@ -148,13 +137,15 @@ def _chunk_kda_bwd_wy_dqkg_fused_kernel(
     dk_ref[0]  = b_dk_full
     dv2_ref[0] = b_dv2
     dg_ref[0]  = b_dg_full
-    db_ref[0]  = b_db_acc
+    db_ref[0]  = b_db_acc[:, None]  # [BT] -> [BT, 1]
     dA_ref[0]  = b_dA_acc
 
 
 def chunk_kda_bwd_wy_dqkg_fused_kernel(
     q, k, v, v_new, g, beta, A, h, do, dh, dv,
     scale, chunk_size=64, block_K=None, block_V=None,
+    cu_seqlens:jax.Array | None = None,
+    chunk_indices:jax.Array | None = None,
 ):
     """
     JAX Pallas implementation of chunk_kda_bwd_wy_dqkg_fused.
@@ -167,9 +158,9 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
         g:      [B, T, H, K]  log-space cumsum gate (base-2 scaled).
         beta:   [B, T, H]     WY beta coefficients.
         A:      [B, T, H, BT] Akk inverse matrix (chunk_size = BT).
-        h:      [B*NT, H, K, V]  per-chunk hidden states.
+        h:      [B, NT, H, K, V]  per-chunk hidden states.
         do:     [B, T, H, V]  output gradient.
-        dh:     [B*NT, H, K, V]  hidden state gradients.
+        dh:     [B, NT, H, K, V]  hidden state gradients.
         dv:     [B, T, H, V]  value gradient.
         scale:  float          softmax scaling factor.
         chunk_size: int        chunk size (BT). T must be divisible by chunk_size.
@@ -233,7 +224,7 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
     v_r    = _r_bthx(v, V)
     vn_r   = _r_bthx(v_new, V)
     g_r    = _r_bthx(g, K)
-    beta_r = _r_bth(beta)
+    beta_r = _r_bth(beta)[..., None]  # [BH*NT, BT, 1] for TPU alignment
     A_r    = _r_bthx(A, BT)
     h_r    = _r_h(h)
     do_r   = _r_bthx(do, V)
@@ -246,17 +237,13 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
         return pl.BlockSpec(block_shape=(1, d1, d2),
                             index_map=lambda idx: (idx, 0, 0))
 
-    def _spec2(d1):
-        return pl.BlockSpec(block_shape=(1, d1),
-                            index_map=lambda idx: (idx, 0))
-
     in_specs = [
         _spec3(BT, K),   # q
         _spec3(BT, K),   # k
         _spec3(BT, V),   # v
         _spec3(BT, V),   # v_new
         _spec3(BT, K),   # g
-        _spec2(BT),      # beta
+        _spec3(BT, 1),   # beta [BT, 1]
         _spec3(BT, BT),  # A
         _spec3(K, V),    # h
         _spec3(BT, V),   # do
@@ -269,7 +256,7 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
         _spec3(BT, K),   # dk
         _spec3(BT, V),   # dv2
         _spec3(BT, K),   # dg
-        _spec2(BT),      # db
+        _spec3(BT, 1),   # db [BT, 1]
         _spec3(BT, BT),  # dA
     ]
 
@@ -278,7 +265,7 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
         jax.ShapeDtypeStruct((total, BT, K), jnp.float32),
         jax.ShapeDtypeStruct((total, BT, V), jnp.float32),
         jax.ShapeDtypeStruct((total, BT, K), jnp.float32),
-        jax.ShapeDtypeStruct((total, BT),    jnp.float32),
+        jax.ShapeDtypeStruct((total, BT, 1), jnp.float32),  # db [BT, 1]
         jax.ShapeDtypeStruct((total, BT, BT), jnp.float32),
     ]
 
@@ -310,7 +297,7 @@ def chunk_kda_bwd_wy_dqkg_fused_kernel(
     return (_ir_bthx(dq_r, K),
             _ir_bthx(dk_r, K),
             _ir_bthx(dv2_r, V),
-            _ir_bth(db_r),
+            _ir_bth(db_r[..., 0]),  # [total, BT, 1] -> [total, BT] -> [B, T, H]
             _ir_bthx(dg_r, K),
             _ir_bthx(dA_r, BT))
 
@@ -327,7 +314,7 @@ def _chunk_kda_bwd_dAv_kernel(
     """Pallas kernel body for dAv — processes one (chunk, batch*head) tile.
 
     Computes dA and dv from the output gradient do, the attention matrix A,
-    and the value tensor v.  V is tiled into BV blocks via fori_loop.
+    and the value tensor v.  V is tiled into BV blocks via unrolled loop.
     """
     bv  = v_ref[0]    # [BT, V]
     bA  = A_ref[0]    # [BT, BT]
@@ -337,29 +324,25 @@ def _chunk_kda_bwd_dAv_kernel(
     m_causal = (o_t[:, None] >= o_t[None, :])
     bA_masked = jnp.where(m_causal, bA, 0.0)
 
-    def _sl2d(x, start, size):
-        return jax.lax.dynamic_slice(x, (0, start), (BT, size))
+    b_dA = jnp.zeros((BT, BT), jnp.float32)
+    dv_blocks = []
 
-    def v_loop_body(i_v, carry):
-        b_dA_acc, b_dv = carry
+    # Unrolled loop over V blocks (NV is a static constant)
+    for i_v in range(NV):
         vs = i_v * BV
+        ve = vs + BV
 
-        b_v_blk  = _sl2d(bv, vs, BV)    # [BT, BV]
-        b_do_blk = _sl2d(bdo, vs, BV)   # [BT, BV]
+        b_v_blk  = bv[:, vs:ve]     # [BT, BV]
+        b_do_blk = bdo[:, vs:ve]    # [BT, BV]
 
         # dA += do @ v^T
-        b_dA_acc = b_dA_acc + b_do_blk.astype(jnp.float32) @ b_v_blk.astype(jnp.float32).T
+        b_dA = b_dA + b_do_blk.astype(jnp.float32) @ b_v_blk.astype(jnp.float32).T
 
         # dv = A^T @ do
         b_dv_blk = bA_masked.T.astype(bdo.dtype) @ b_do_blk  # [BT, BV]
-        b_dv = jax.lax.dynamic_update_slice(b_dv, b_dv_blk, (0, vs))
+        dv_blocks.append(b_dv_blk)
 
-        return b_dA_acc, b_dv
-
-    b_dA = jnp.zeros((BT, BT), jnp.float32)
-    b_dv = jnp.zeros((BT, V), bdo.dtype)
-
-    b_dA, b_dv = jax.lax.fori_loop(0, NV, v_loop_body, (b_dA, b_dv))
+    b_dv = jnp.concatenate(dv_blocks, axis=1) if len(dv_blocks) > 1 else dv_blocks[0]
 
     # Apply causal mask and scale
     b_dA = jnp.where(m_causal, b_dA * scale, 0.0)
@@ -371,6 +354,8 @@ def _chunk_kda_bwd_dAv_kernel(
 def chunk_kda_bwd_dAv_kernel(
     q, k, v, do, A,
     scale, chunk_size=64, block_V=None,
+    cu_seqlens:jax.Array | None = None,
+    chunk_indices:jax.Array | None = None,
 ):
     """JAX Pallas implementation of chunk_kda_bwd_dAv.
 
@@ -488,9 +473,12 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
     bdv = dv_ref[0]   # [NT, BT, V]
     bdht = dht_ref[0]  # [K, V]
 
-    # Reverse scan through chunks
-    def scan_fn(carry, t_rev):
-        b_dh = carry  # [K, V]
+    # Reverse loop through chunks (replaces jax.lax.scan with extensive outputs)
+    b_dh = bdht.astype(jnp.float32)  # [K, V]
+    dh_list = []
+    dv2_list = []
+
+    for t_rev in range(NT):
         i_t = NT - 1 - t_rev
 
         b_q_t  = bq[i_t]    # [BT, K]
@@ -501,7 +489,7 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
         b_dv_t = bdv[i_t]   # [BT, V]
 
         # Store current dh before updating
-        dh_out = b_dh  # [K, V]
+        dh_list.append(b_dh)  # [K, V]
 
         # Last position gate value
         b_gk_last = b_gk_t[BT - 1]  # [K]
@@ -509,6 +497,7 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
         # dv2 = k @ dh + dv
         b_dv2 = (b_k_t.astype(jnp.float32) @ b_dh.astype(jnp.float32)
                  + b_dv_t.astype(jnp.float32))  # [BT, V]
+        dv2_list.append(b_dv2)
 
         # Update dh: apply gk gating
         b_dh = b_dh * exp2(b_gk_last[:, None])  # [K, V]
@@ -519,14 +508,10 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
             - b_w_t.astype(jnp.float32).T @ b_dv2
         )
 
-        return b_dh, (dh_out, b_dv2)
-
-    init_dh = bdht.astype(jnp.float32)
-
-    final_dh, (dh_all, dv2_all) = jax.lax.scan(scan_fn, init_dh, jnp.arange(NT))
-    # dh_all is [NT, K, V] in reverse order; reverse to natural order
-    dh_all = dh_all[::-1]
-    dv2_all = dv2_all[::-1]
+    final_dh = b_dh
+    # dh_list is in reverse order; reverse to natural order and stack
+    dh_all = jnp.stack(dh_list[::-1], axis=0)    # [NT, K, V]
+    dv2_all = jnp.stack(dv2_list[::-1], axis=0)  # [NT, BT, V]
 
     dh_ref[0] = dh_all         # [NT, K, V]
     dh0_ref[0] = final_dh      # [K, V] — gradient of initial state
@@ -536,6 +521,9 @@ def _chunk_gated_delta_rule_bwd_dhu_kernel(
 def chunk_gated_delta_rule_bwd_dhu_kernel(
     q, k, w, gk, h0, dht, do, dv,
     scale, chunk_size=64,
+    cu_seqlens:jax.Array | None = None,
+    chunk_indices:jax.Array | None = None,
+    use_exp2:bool = True,
 ):
     """JAX Pallas implementation of chunk_gated_delta_rule_bwd_dhu.
 
@@ -655,3 +643,188 @@ def chunk_gated_delta_rule_bwd_dhu_kernel(
                  .reshape(B, T, H, V))
 
     return dh, dh0, dv2
+
+
+# =====================================================================
+# chunk_kda_bwd  —  6-stage backward orchestrator
+# =====================================================================
+
+
+def chunk_kda_bwd(
+    q: jax.Array,           # [B, T, H, K]
+    k: jax.Array,           # [B, T, H, K]
+    v: jax.Array,           # [B, T, H, V]
+    beta: jax.Array,        # [B, T, H]
+    Aqk: jax.Array,         # [B, T, H, BT]
+    Akk: jax.Array,         # [B, T, H, BT]
+    scale: float,
+    initial_state: jax.Array,  # [B, H, K, V]
+    do: jax.Array,          # [B, T, H, V]
+    dht: jax.Array,  # [B, H, K, V]
+    *,
+    g: jax.Array | None = None,       # [B, T, H, K] — post cumsum, log2 space
+    g_org: jax.Array | None = None,   # [B, T, H, K] — original gate
+    cu_seqlens: jax.Array | None = None,
+    chunk_indices: jax.Array | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: jax.Array | None = None,
+    dt_bias: jax.Array | None = None,
+    disable_recompute: bool = False,
+    cp_context = None,
+    transpose_state_layout: bool = False,
+    **kwargs
+):
+    """Chunk KDA backward — 6-stage pipeline.
+
+    Aligned with FLA fla.ops.kda.chunk_bwd.chunk_kda_bwd.
+
+    Stage 0: recompute forward intermediates (w, u, qg, kg, h, v_new)
+    Stage 1: chunk_kda_bwd_dAv -> dAqk, dv
+    Stage 2: chunk_gated_delta_rule_bwd_dhu -> dh, dh0, dv
+    Stage 3: chunk_kda_bwd_wy_dqkg_fused -> dq, dk, dv, db, dg, dAkk
+    Stage 4: chunk_kda_bwd_intra -> refine dq, dk, db, dg
+    Stage 5: reverse cumsum on dg
+
+    Args:
+        q:     [B, T, H, K]   — query vectors.
+        k:     [B, T, H, K]   — key vectors.
+        v:     [B, T, H, V]   — value vectors.
+        beta:  [B, T, H]      — per-token mixing coefficient.
+        Aqk:   [B, T, H, BT]  — intra-chunk attention matrix (from fwd).
+        Akk:   [B, T, H, BT]  — Akk inverse matrix (from fwd).
+        scale: float           — attention scale factor.
+        initial_state: [B, H, K, V] or None — initial hidden state.
+        do:    [B, T, H, V]   — output gradient.
+        dht:   [B, H, K, V] or None — final state gradient.
+        g:     [B, T, H, K]   — post cumsum gate in log2 space.
+        chunk_size: int        — tile size.
+
+    Returns:
+        dq:    [B, T, H, K]
+        dk:    [B, T, H, K]
+        dv:    [B, T, H, V]
+        db:    [B, T, H]
+        dg:    [B, T, H, K]
+        dh0:   [B, H, K, V] or None
+        dA:    [H] or None — gate parameter gradient (only when use_gate_in_kernel=True).
+        dbias: [H*K] or None — gate bias gradient (only when use_gate_in_kernel=True).
+    """
+
+
+    # ============= assert input shapes and static properties =============
+
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+
+    assert_shape(q, (B, T, H, K), "q")
+    assert_shape(k, (B, T, H, K), "k")
+    assert_shape(v, (B, T, H, V), "v")
+    assert_shape(beta, (B, T, H), "beta")
+    assert_shape(Aqk, (B, T, H, BT), "Aqk")
+    assert_shape(Akk, (B, T, H, BT), "Akk")
+    assert_shape(do, (B, T, H, V), "do")
+    assert_shape_or_none(initial_state, (B, H, K, V), "initial_state")
+    assert_shape_or_none(dht, (B, H, K, V), "dht")
+    assert g is not None, "g (post-cumsum, log2 space) must be provided"
+    assert_shape(g, (B, T, H, K), "g")
+    assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
+    assert cp_context is None, "not support custom call context yet"
+    assert cu_seqlens is None, "not support cu_seqlens yet"
+    assert chunk_indices is None, "not support chunk_indices yet"
+    assert transpose_state_layout is False, "not support transpose_state_layout yet"
+    # ============= assert input shapes and static properties =============
+
+    # ---- Stage 0: Recompute forward intermediates ----
+    if disable_recompute is False:
+        if use_gate_in_kernel:
+            g = kda_gate_chunk_cumsum(
+                g=g_org,
+                chunk_size=chunk_size,
+            )
+        w, u, qg, kg = recompute_w_u_fwd(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            A=Akk,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        assert kg is not None
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            chunk_size = chunk_size,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+    else:
+        w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
+
+    # ---- Stage 1: dAqk and initial dv ----
+    dAqk, dv = chunk_kda_bwd_dAv_kernel(
+        q=q, k=k, v=v_new, do=do, A=Aqk,
+        scale=scale, chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+    # ---- Stage 2: dh, dh0, dv (reverse recurrence) ----
+    # Uses gated q/k (qg, kg), not raw q/k.
+    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu_kernel(
+        q=qg, k=kg, w=w, gk=g,
+        h0=initial_state, dht=dht,
+        do=do, dv=dv,
+        scale=scale, chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+    )
+
+    # ---- Stage 3: Fused WY backward ----
+    # A=Akk (not Aqk).
+    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused_kernel(
+        q=q, k=k, v=v, v_new=v_new, g=g, beta=beta,
+        A=Akk, h=h, do=do, dh=dh, dv=dv,
+        scale=scale, chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+    # ---- Stage 4: Intra-chunk backward (Pallas) ----
+
+    dq, dk, db, dg  = chunk_kda_bwd_intra(
+        q=q, k=k, g=g, beta=beta,
+        dAqk=dAqk, dAkk=dAkk,
+        dq=dq, dk=dk, db=db, dg=dg,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        safe_gate=safe_gate,
+        chunk_size=chunk_size,
+    )
+
+    # ---- Stage 5: Reverse cumsum on dg ----
+    dA, dbias = None, None
+    dg = chunk_local_cumsum(
+        dg, chunk_size=chunk_size, reverse=True,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+    )
+    if use_gate_in_kernel:
+        dg, dA, dbias = kda_gate_bwd(
+            g=g_org,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            dyg=dg,
+            lower_bound=lower_bound
+        )
+    return dq, dk, dv, db, dg, dh0, dA, dbias
